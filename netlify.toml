@@ -1,0 +1,7 @@
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+# (optional) preview builds ke liye env propagate
+[build.environment]
+  NODE_VERSION = "18"

@@ -1,96 +1,88 @@
-// Create Cashfree order + session, returns { order_id, payment_session_id }
-// URL: /.netlify/functions/create-order
-const allowed = (process.env.ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
+// Create Cashfree order and return payment_session_id
+const BASES = {
+  PROD: "https://api.cashfree.com",
+  SANDBOX: "https://sandbox.cashfree.com",
+};
 
 function corsHeaders(origin) {
-  const allow = allowed.includes(origin) ? origin : (allowed[0] || "*");
-  return {
-    "Access-Control-Allow-Origin": allow,
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Access-Control-Allow-Methods": "OPTIONS, POST, GET",
-    "Access-Control-Max-Age": "86400",
-  };
+  const allowed = (process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+  const ok = allowed.includes(origin) ? origin : "";
+  return ok
+    ? {
+        "Access-Control-Allow-Origin": ok,
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      }
+    : {};
 }
 
 exports.handler = async (event) => {
-  const origin = event.headers.origin || event.headers.Origin || "";
-  const headers = corsHeaders(origin);
+  const headers = corsHeaders(event.headers?.origin || event.headers?.Origin);
 
+  // Preflight
   if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 200, headers, body: "" };
+    return { statusCode: 204, headers };
   }
   if (event.httpMethod !== "POST") {
-    return { statusCode: 405, headers, body: JSON.stringify({ error: "Method not allowed" }) };
+    return { statusCode: 405, headers, body: "Method Not Allowed" };
   }
 
   try {
-    const {
-      amount,
-      currency = "INR",
-      purpose = "generic",
-      adId = null,
-      email = null,
-      phone = null,
-      userId = null,
-    } = JSON.parse(event.body || "{}");
-
+    const { amount, currency = "INR", customer = {}, meta = {} } = JSON.parse(event.body || "{}");
     if (!amount) {
-      return { statusCode: 400, headers, body: JSON.stringify({ error: "amount required" }) };
+      return { statusCode: 400, headers, body: JSON.stringify({ error: "amount missing" }) };
     }
 
-    const base = process.env.CASHFREE_ENV === "PROD"
-      ? "https://api.cashfree.com/pg"
-      : "https://sandbox.cashfree.com/pg";
+    const appId = process.env.CASHFREE_APP_ID;
+    const secret = process.env.CASHFREE_SECRET_KEY;
+    const env = (process.env.CASHFREE_ENV || "SANDBOX").toUpperCase();
+    const base = BASES[env] || BASES.SANDBOX;
 
-    const order_id = `bbz_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const order_id = meta.order_id || `order_${Date.now()}`;
 
-    const orderPayload = {
-      order_id,
-      order_amount: Number(amount),
-      order_currency: currency,
-      order_note: `${purpose}${adId ? ":" + adId : ""}`,
-      customer_details: {
-        customer_id: userId || `guest_${Date.now()}`,
-        ...(email ? { customer_email: email } : {}),
-        ...(phone ? { customer_phone: phone } : {}),
+    const res = await fetch(`${base}/pg/orders`, {
+      method: "POST",
+      headers: {
+        "x-client-id": appId,
+        "x-client-secret": secret,
+        "x-api-version": "2022-09-01",
+        "Content-Type": "application/json",
       },
+      body: JSON.stringify({
+        order_id,
+        order_amount: Number(amount),
+        order_currency: currency,
+        customer_details: {
+          customer_id: customer.id || `cust_${Date.now()}`,
+          customer_name: customer.name || "Guest",
+          customer_email: customer.email || "guest@example.com",
+          customer_phone: customer.phone || "9999999999",
+        },
+        // optional: return_url or notify_url if you ever need
+      }),
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+      return { statusCode: res.status, headers, body: JSON.stringify({ error: data }) };
+    }
+
+    return {
+      statusCode: 200,
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify({
+        ok: true,
+        env,
+        order_id: data.order_id,
+        payment_session_id: data.payment_session_id,
+        order_status: data.order_status,
+      }),
     };
-
-    // 1) Create order
-    const r1 = await fetch(`${base}/orders`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-client-id": process.env.CASHFREE_APP_ID,
-        "x-client-secret": process.env.CASHFREE_SECRET_KEY,
-        "x-api-version": "2022-09-01",
-      },
-      body: JSON.stringify(orderPayload),
-    });
-    const d1 = await r1.json();
-    if (!r1.ok) {
-      return { statusCode: r1.status, headers, body: JSON.stringify({ error: "create order failed", details: d1 }) };
-    }
-
-    // 2) Create session (to get payment_session_id for UI SDK)
-    const r2 = await fetch(`${base}/orders/sessions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-client-id": process.env.CASHFREE_APP_ID,
-        "x-client-secret": process.env.CASHFREE_SECRET_KEY,
-        "x-api-version": "2022-09-01",
-      },
-      body: JSON.stringify({ order_id }),
-    });
-    const d2 = await r2.json();
-    if (!r2.ok) {
-      return { statusCode: r2.status, headers, body: JSON.stringify({ error: "create session failed", details: d2 }) };
-    }
-
-    const payment_session_id = d2.payment_session_id || d1.payment_session_id || d1.order_token;
-    return { statusCode: 200, headers, body: JSON.stringify({ order_id, payment_session_id }) };
   } catch (e) {
-    return { statusCode: 500, headers, body: JSON.stringify({ error: "server error", details: e.message }) };
+    return { statusCode: 500, headers, body: JSON.stringify({ error: e.message }) };
   }
 };
+

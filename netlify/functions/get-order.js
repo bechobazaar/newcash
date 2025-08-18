@@ -1,52 +1,60 @@
-// Get order status from Cashfree, returns { order_status, ... }
-// URL: /.netlify/functions/get-order?order_id=xxxxx
-const allowed = (process.env.ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
+// Fetch Cashfree order details
+const BASES = {
+  PROD: "https://api.cashfree.com",
+  SANDBOX: "https://sandbox.cashfree.com",
+};
 
 function corsHeaders(origin) {
-  const allow = allowed.includes(origin) ? origin : (allowed[0] || "*");
-  return {
-    "Access-Control-Allow-Origin": allow,
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Access-Control-Allow-Methods": "OPTIONS, GET",
-    "Access-Control-Max-Age": "86400",
-  };
+  const allowed = (process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+  const ok = allowed.includes(origin) ? origin : "";
+  return ok
+    ? {
+        "Access-Control-Allow-Origin": ok,
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      }
+    : {};
 }
 
 exports.handler = async (event) => {
-  const origin = event.headers.origin || event.headers.Origin || "";
-  const headers = corsHeaders(origin);
+  const headers = corsHeaders(event.headers?.origin || event.headers?.Origin);
 
   if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 200, headers, body: "" };
+    return { statusCode: 204, headers };
   }
   if (event.httpMethod !== "GET") {
-    return { statusCode: 405, headers, body: JSON.stringify({ error: "Method not allowed" }) };
-  }
-
-  const order_id = (event.queryStringParameters || {}).order_id;
-  if (!order_id) {
-    return { statusCode: 400, headers, body: JSON.stringify({ error: "order_id required" }) };
+    return { statusCode: 405, headers, body: "Method Not Allowed" };
   }
 
   try {
-    const base = process.env.CASHFREE_ENV === "PROD"
-      ? "https://api.cashfree.com/pg"
-      : "https://sandbox.cashfree.com/pg";
+    const order_id = event.queryStringParameters?.order_id;
+    if (!order_id) return { statusCode: 400, headers, body: JSON.stringify({ error: "order_id missing" }) };
 
-    const r = await fetch(`${base}/orders/${encodeURIComponent(order_id)}`, {
+    const appId = process.env.CASHFREE_APP_ID;
+    const secret = process.env.CASHFREE_SECRET_KEY;
+    const env = (process.env.CASHFREE_ENV || "SANDBOX").toUpperCase();
+    const base = BASES[env] || BASES.SANDBOX;
+
+    const res = await fetch(`${base}/pg/orders/${encodeURIComponent(order_id)}`, {
       method: "GET",
       headers: {
-        "x-client-id": process.env.CASHFREE_APP_ID,
-        "x-client-secret": process.env.CASHFREE_SECRET_KEY,
+        "x-client-id": appId,
+        "x-client-secret": secret,
         "x-api-version": "2022-09-01",
       },
     });
-    const d = await r.json();
-    if (!r.ok) {
-      return { statusCode: r.status, headers, body: JSON.stringify({ error: "lookup failed", details: d }) };
-    }
-    return { statusCode: 200, headers, body: JSON.stringify(d) };
+
+    const data = await res.json();
+    const code = res.ok ? 200 : res.status;
+    return {
+      statusCode: code,
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify(data),
+    };
   } catch (e) {
-    return { statusCode: 500, headers, body: JSON.stringify({ error: "server error", details: e.message }) };
+    return { statusCode: 500, headers, body: JSON.stringify({ error: e.message }) };
   }
 };

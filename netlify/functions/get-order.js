@@ -1,60 +1,79 @@
-// Node 18+: uses global fetch. No 'node-fetch' needed.
+// netlify/functions/get-order.js
+const { CASHFREE_APP_ID, CASHFREE_SECRET_KEY, CASHFREE_ENV, ALLOWED_ORIGINS } = process.env;
 
-// --- Dynamic CORS (echo a single allowed origin) ---
-function parseAllowedOriginsEnv() {
-  const raw = process.env.ALLOWED_ORIGINS || "";
-  return raw
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean);
+const CF_API_BASE =
+  (CASHFREE_ENV || "production") === "sandbox"
+    ? "https://sandbox.cashfree.com/pg"
+    : "https://api.cashfree.com/pg";
+
+function pickOrigin(event) {
+  const reqOrigin = event.headers?.origin || "";
+  const allow = (ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
+  return allow.includes(reqOrigin) ? reqOrigin : (allow[0] || "*");
 }
-const DEFAULT_ALLOWED = [
-  "https://www.bechobazaar.com",
-  "https://bechobazaar.com",
-  "https://bechobazaar.netlify.app",
-];
 
-function cors(event) {
-  const requestOrigin = event.headers?.origin || "";
-  const allowed = parseAllowedOriginsEnv();
-  const whitelist = allowed.length ? allowed : DEFAULT_ALLOWED;
-  const allowOrigin = whitelist.includes(requestOrigin) ? requestOrigin : whitelist[0];
-
+function corsHeaders(origin) {
   return {
-    "Access-Control-Allow-Origin": allowOrigin,
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Origin": origin,
+    "Vary": "Origin",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization"
   };
 }
-const ok  = (event, body)           => ({ statusCode: 200, headers: cors(event), body: JSON.stringify(body) });
-const err = (event, status, body)   => ({ statusCode: status, headers: cors(event), body: JSON.stringify(body) });
 
 exports.handler = async (event) => {
-  // Preflight
-  if (event.httpMethod === "OPTIONS") return ok(event, { ok: true });
+  const origin = pickOrigin(event);
 
-  const order_id = event.queryStringParameters?.order_id;
-  if (!order_id) return err(event, 400, { message: "order_id required" });
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 204, headers: corsHeaders(origin) };
+  }
+
+  if (event.httpMethod !== "GET") {
+    return { statusCode: 405, headers: corsHeaders(origin), body: "Method Not Allowed" };
+  }
+
+  const orderId = event.queryStringParameters?.order_id;
+  if (!orderId) {
+    return { statusCode: 400, headers: corsHeaders(origin), body: "order_id required" };
+  }
 
   try {
-    const CF_ENV = process.env.CASHFREE_ENV || "production";
-    const BASE = CF_ENV === "sandbox"
-      ? "https://sandbox.cashfree.com/pg"
-      : "https://api.cashfree.com/pg";
-
-    const r = await fetch(`${BASE}/orders/${encodeURIComponent(order_id)}`, {
+    const r = await fetch(`${CF_API_BASE}/orders/${encodeURIComponent(orderId)}`, {
       method: "GET",
       headers: {
-        "x-client-id":     process.env.CASHFREE_APP_ID,
-        "x-client-secret": process.env.CASHFREE_SECRET_KEY,
-        "x-api-version":   "2022-09-01",
+        "x-client-id": CASHFREE_APP_ID,
+        "x-client-secret": CASHFREE_SECRET_KEY,
+        "x-api-version": "2022-09-01"
       }
     });
 
     const data = await r.json();
-    if (!r.ok) return err(event, r.status, data);
-    return ok(event, data); // includes order_status, order_tags, etc.
+
+    if (!r.ok) {
+      return {
+        statusCode: r.status,
+        headers: corsHeaders(origin),
+        body: JSON.stringify({ error: "cashfree_error", details: data })
+      };
+    }
+
+    // Minimal surface needed by client
+    return {
+      statusCode: 200,
+      headers: corsHeaders(origin),
+      body: JSON.stringify({
+        order_id: data.order_id,
+        order_status: data.order_status,
+        order_amount: data.order_amount,
+        order_currency: data.order_currency,
+        order_tags: data.order_tags || null
+      })
+    };
   } catch (e) {
-    return err(event, 500, { error: e.message });
+    return {
+      statusCode: 500,
+      headers: corsHeaders(origin),
+      body: JSON.stringify({ error: "server_error", message: e.message })
+    };
   }
 };

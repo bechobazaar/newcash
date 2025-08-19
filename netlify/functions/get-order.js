@@ -1,60 +1,39 @@
-// Fetch Cashfree order details
-const BASES = {
-  PROD: "https://api.cashfree.com",
-  SANDBOX: "https://sandbox.cashfree.com",
-};
+// Node 18+: uses global fetch (no node-fetch import)
 
-function corsHeaders(origin) {
-  const allowed = (process.env.ALLOWED_ORIGINS || "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean);
-  const ok = allowed.includes(origin) ? origin : "";
-  return ok
-    ? {
-        "Access-Control-Allow-Origin": ok,
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      }
-    : {};
-}
+const ok = (body) => ({ statusCode: 200, headers: cors(), body: JSON.stringify(body) });
+const err = (status, body) => ({ statusCode: status, headers: cors(), body: JSON.stringify(body) });
+const cors = () => ({
+  "Access-Control-Allow-Origin": process.env.ALLOWED_ORIGINS || "https://www.bechobazaar.com",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
+});
 
 exports.handler = async (event) => {
-  const headers = corsHeaders(event.headers?.origin || event.headers?.Origin);
+  if (event.httpMethod === "OPTIONS") return ok({ ok: true });
 
-  if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 204, headers };
-  }
-  if (event.httpMethod !== "GET") {
-    return { statusCode: 405, headers, body: "Method Not Allowed" };
-  }
+  const order_id = event.queryStringParameters?.order_id;
+  if (!order_id) return err(400, { message: "order_id required" });
 
   try {
-    const order_id = event.queryStringParameters?.order_id;
-    if (!order_id) return { statusCode: 400, headers, body: JSON.stringify({ error: "order_id missing" }) };
+    const CF_ENV = process.env.CASHFREE_ENV || "production";
+    const BASE = CF_ENV === "sandbox"
+      ? "https://sandbox.cashfree.com/pg"
+      : "https://api.cashfree.com/pg";
 
-    const appId = process.env.CASHFREE_APP_ID;
-    const secret = process.env.CASHFREE_SECRET_KEY;
-    const env = (process.env.CASHFREE_ENV || "SANDBOX").toUpperCase();
-    const base = BASES[env] || BASES.SANDBOX;
-
-    const res = await fetch(`${base}/pg/orders/${encodeURIComponent(order_id)}`, {
+    const r = await fetch(`${BASE}/orders/${encodeURIComponent(order_id)}`, {
       method: "GET",
       headers: {
-        "x-client-id": appId,
-        "x-client-secret": secret,
-        "x-api-version": "2022-09-01",
-      },
+        "x-client-id": process.env.CASHFREE_APP_ID,
+        "x-client-secret": process.env.CASHFREE_SECRET_KEY,
+        "x-api-version": "2022-09-01"
+      }
     });
 
-    const data = await res.json();
-    const code = res.ok ? 200 : res.status;
-    return {
-      statusCode: code,
-      headers: { "Content-Type": "application/json", ...headers },
-      body: JSON.stringify(data),
-    };
+    const data = await r.json();
+    if (!r.ok) return err(r.status, data);
+    return ok(data);
   } catch (e) {
-    return { statusCode: 500, headers, body: JSON.stringify({ error: e.message }) };
+    return err(500, { error: e.message });
   }
 };
+

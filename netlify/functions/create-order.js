@@ -1,111 +1,116 @@
 // netlify/functions/create-order.js
-// Node 18+: uses global fetch
+// Node 18+ (global fetch). No node-fetch needed.
 
-/* ---------------- CORS (dynamic: echo a single allowed origin) ---------------- */
-function parseAllowedOriginsEnv() {
-  const raw = process.env.ALLOWED_ORIGINS || "";
-  return raw.split(",").map(s => s.trim()).filter(Boolean);
+const { CASHFREE_APP_ID, CASHFREE_SECRET_KEY, CASHFREE_ENV, ALLOWED_ORIGINS, PUBLIC_BASE } = process.env;
+
+const CF_API_BASE =
+  (CASHFREE_ENV || "production") === "sandbox"
+    ? "https://sandbox.cashfree.com/pg"
+    : "https://api.cashfree.com/pg";
+
+function pickOrigin(event) {
+  const reqOrigin = event.headers?.origin || "";
+  const allow = (ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
+  // If request origin is in allowlist, use it. Else use the first allowlisted origin (if any)
+  return allow.includes(reqOrigin) ? reqOrigin : (allow[0] || "*");
 }
-const DEFAULT_ALLOWED = [
-  "https://www.bechobazaar.com",
-  "https://bechobazaar.com",
-  "https://bechobazaar.netlify.app",
-];
 
-function cors(event) {
-  const origin = event.headers?.origin || "";
-  const wl = parseAllowedOriginsEnv();
-  const list = wl.length ? wl : DEFAULT_ALLOWED;
-  const allow = list.includes(origin) ? origin : list[0];
+function corsHeaders(origin) {
   return {
-    "Access-Control-Allow-Origin": allow,
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Origin": origin,
+    "Vary": "Origin",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization"
   };
 }
-const ok  = (event, body)         => ({ statusCode: 200, headers: cors(event), body: JSON.stringify(body) });
-const err = (event, status, body) => ({ statusCode: status, headers: cors(event), body: JSON.stringify(body) });
 
-/* ---------------- Handler ---------------- */
 exports.handler = async (event) => {
-  // Preflight
-  if (event.httpMethod === "OPTIONS") return ok(event, { ok: true });
+  const origin = pickOrigin(event);
+
+  if (event.httpMethod === "OPTIONS") {
+    // Preflight
+    return { statusCode: 204, headers: corsHeaders(origin) };
+  }
+
+  if (event.httpMethod !== "POST") {
+    return { statusCode: 405, headers: corsHeaders(origin), body: "Method Not Allowed" };
+  }
 
   try {
-    // Client payload (amount, purpose, adId); customer NOT required from client
-    const { amount, purpose, adId } = JSON.parse(event.body || "{}");
-
-    if (!amount || !purpose) {
-      return err(event, 400, { message: "amount & purpose required" });
+    if (!CASHFREE_APP_ID || !CASHFREE_SECRET_KEY) {
+      return { statusCode: 500, headers: corsHeaders(origin), body: "Cashfree keys missing" };
     }
 
-    // Ensure Cashfree creds
-    const APP_ID = process.env.CASHFREE_APP_ID;
-    const SECRET = process.env.CASHFREE_SECRET_KEY;
-    if (!APP_ID || !SECRET) {
-      return err(event, 500, { message: "Cashfree keys missing (CASHFREE_APP_ID / CASHFREE_SECRET_KEY)" });
+    const body = JSON.parse(event.body || "{}");
+    const amount = Number(body.amount);
+    const currency = (body.currency || "INR").toUpperCase();
+    const purpose = (body.purpose || "").toLowerCase();         // 'boost' | 'post_fee'
+    const adId = body.adId || null;
+    const planDays = body.planDays ? Number(body.planDays) : undefined;
+
+    const uid = body.customer?.id || "guest";                    // <— will be your Firebase UID from client
+    const email = body.customer?.email;
+    const phone = body.customer?.phone;
+
+    if (!amount || !purpose || !adId) {
+      return { statusCode: 400, headers: corsHeaders(origin), body: "amount/purpose/adId required" };
     }
 
-    // Env & endpoints
-    const CF_ENV = process.env.CASHFREE_ENV || "production"; // 'sandbox' | 'production'
-    const BASE = CF_ENV === "sandbox"
-      ? "https://sandbox.cashfree.com/pg"
-      : "https://api.cashfree.com/pg";
+    const orderId = `bb_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-    // Where Cashfree should return after payment (success/fail/cancel)
-    const RETURN_URL = process.env.RETURN_URL
-      || "https://www.bechobazaar.com/account.html?cf=1&order_id={order_id}";
-
-    // Build Cashfree order payload
-    const payload = {
-      order_amount: Number(amount),
-      order_currency: "INR",
-      order_note: String(purpose),
-      // Helpful context for resume on return
-      order_tags: {
-        purpose: String(purpose),
-        adId: String(adId || ""),
-        amount: String(amount || "")
-      },
-      // Dummy-but-valid customer info (no real email/phone needed)
+    const payloadCF = {
+      order_id: orderId,
+      order_amount: amount,
+      order_currency: currency,
       customer_details: {
-        customer_id: "guest",
-        customer_email: "anon@example.com",
-        customer_phone: "9999999999"
+        customer_id: uid,                // <— IMPORTANT: not "guest" now
+        ...(email ? { customer_email: email } : {}),
+        ...(phone ? { customer_phone: phone } : {})
       },
       order_meta: {
-        return_url: RETURN_URL,
-        notify_url: process.env.NOTIFY_URL || "" // optional webhook
+        // Cashfree will replace {order_id} server-side
+        return_url: `${(PUBLIC_BASE || "https://www.bechobazaar.com").replace(/\/+$/, "")}/account.html?cf=1&order_id={order_id}`
+      },
+      order_tags: {
+        purpose, adId, amount, planDays, userId: uid
       }
     };
 
-    // Create order
-    const r = await fetch(`${BASE}/orders`, {
+    const r = await fetch(`${CF_API_BASE}/orders`, {
       method: "POST",
       headers: {
-        "x-client-id":     APP_ID,
-        "x-client-secret": SECRET,
-        "x-api-version":   "2022-09-01",
-        "Content-Type":    "application/json"
+        "x-client-id": CASHFREE_APP_ID,
+        "x-client-secret": CASHFREE_SECRET_KEY,
+        "x-api-version": "2022-09-01",
+        "Content-Type": "application/json"
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payloadCF)
     });
 
-    const text = await r.text();
-    let data;
-    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+    const data = await r.json();
 
     if (!r.ok) {
-      // Pass-through Cashfree error so client can see exact reason
-      return err(event, r.status, data);
+      return {
+        statusCode: r.status,
+        headers: corsHeaders(origin),
+        body: JSON.stringify({ error: "cashfree_error", details: data })
+      };
     }
 
-    // Success → return ids to client
-    return ok(event, {
-      order_id: data.order_id,
-      payment_session_id: data.payment_session_id
-    });
-  } catch (e) {
-    return err(event, 500, { error: e.message });
+    return {
+      statusCode: 200,
+      headers: corsHeaders(origin),
+      body: JSON.stringify({
+        order_id: data.order_id,
+        payment_session_id: data.payment_session_id,
+        order_status: data.order_status || "CREATED"
+      })
+    };
+  } catch (err) {
+    return {
+      statusCode: 500,
+      headers: corsHeaders(origin),
+      body: JSON.stringify({ error: "server_error", message: err.message })
+    };
   }
 };

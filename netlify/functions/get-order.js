@@ -1,103 +1,139 @@
-// netlify/functions/get-order.js
-const fetch = require("node-fetch");
+// get-order.js — Netlify Function (no fetch, uses https)
+// - Reads a Cashfree order by ID and returns its status + tags for resume
+// - Clean CORS with single Access-Control-Allow-Origin value
 
-const CF_ENV = process.env.CASHFREE_ENV || "production"; // "sandbox" | "production"
-const APP_ID = process.env.CASHFREE_APP_ID;
-const SECRET = process.env.CASHFREE_SECRET_KEY;
+const https = require("https");
 
-// CORS: single origin only
+const ENV = process.env.CASHFREE_ENV === "sandbox" ? "sandbox" : "production";
+const CF_HOST = ENV === "sandbox" ? "sandbox.cashfree.com" : "api.cashfree.com";
+const CF_APP_ID = process.env.CASHFREE_APP_ID || "";
+const CF_SECRET = process.env.CASHFREE_SECRET_KEY || "";
 const ALLOWED = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
-const makeCors = (origin) => ({
-  "Access-Control-Allow-Origin": ALLOWED.includes(origin)
-    ? origin
-    : (ALLOWED[0] || origin || "*"),
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
-});
+
+function pickOrigin(event) {
+  const reqOrigin =
+    event.headers?.origin ||
+    event.headers?.Origin ||
+    event.headers?.ORIGIN ||
+    "";
+  if (ALLOWED.includes(reqOrigin)) return reqOrigin;
+  return ALLOWED[0] || "";
+}
+
+function corsHeaders(event) {
+  const allowOrigin = pickOrigin(event);
+  const base = {
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  };
+  if (allowOrigin) base["Access-Control-Allow-Origin"] = allowOrigin;
+  return base;
+}
+
+function ok(body, event) {
+  return {
+    statusCode: 200,
+    headers: corsHeaders(event),
+    body: JSON.stringify(body),
+  };
+}
+
+function bad(status, msg, event) {
+  return {
+    statusCode: status,
+    headers: corsHeaders(event),
+    body: JSON.stringify({ error: msg }),
+  };
+}
+
+function httpsJSON({ host, path, method = "GET", headers = {} }) {
+  const opts = {
+    host,
+    path,
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-version": "2022-09-01",
+      ...headers,
+    },
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(opts, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        try {
+          const json = data ? JSON.parse(data) : {};
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(json);
+          } else {
+            const err = new Error(
+              `CF GET ${path} ${res.statusCode}: ${data}`
+            );
+            err.statusCode = res.statusCode;
+            err.body = json;
+            reject(err);
+          }
+        } catch (e) {
+          e.message = `CF parse error: ${e.message} :: ${data}`;
+          reject(e);
+        }
+      });
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
 
 exports.handler = async (event) => {
-  const origin = event.headers.origin || event.headers.Origin || "";
-  const headers = makeCors(origin);
-
   if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 200, headers, body: "" };
-  }
-  if (event.httpMethod !== "GET") {
-    return { statusCode: 405, headers, body: "Method Not Allowed" };
+    return { statusCode: 200, headers: corsHeaders(event), body: "" };
   }
 
-  const orderId = event.queryStringParameters && event.queryStringParameters.order_id;
-  if (!orderId) {
-    return { statusCode: 400, headers, body: JSON.stringify({ error: "order_id required" }) };
+  if (event.httpMethod !== "GET") {
+    return bad(405, "Method Not Allowed", event);
   }
-  if (!APP_ID || !SECRET) {
-    return { statusCode: 500, headers, body: JSON.stringify({ error: "server not configured" }) };
+
+  if (!CF_APP_ID || !CF_SECRET) {
+    return bad(500, "Cashfree credentials missing on server", event);
   }
+
+  const orderId = event.queryStringParameters?.order_id;
+  if (!orderId) return bad(400, "order_id is required", event);
 
   try {
-    const host = CF_ENV === "sandbox"
-      ? "https://sandbox.cashfree.com"
-      : "https://api.cashfree.com";
-
-    const cfHeaders = {
-      "x-api-version": "2022-09-01",
-      "x-client-id": APP_ID,
-      "x-client-secret": SECRET,
-    };
-
-    // 1) Order details
-    const oRes = await fetch(`${host}/pg/orders/${encodeURIComponent(orderId)}`, {
+    const json = await httpsJSON({
+      host: CF_HOST,
+      path: `/pg/orders/${encodeURIComponent(orderId)}`,
       method: "GET",
-      headers: cfHeaders,
+      headers: {
+        "x-client-id": CF_APP_ID,
+        "x-client-secret": CF_SECRET,
+      },
     });
-    const oText = await oRes.text();
-    if (!oRes.ok) {
-      return { statusCode: oRes.status, headers, body: oText };
-    }
-    const order = JSON.parse(oText);
 
-    // 2) Latest payment (optional but helpful)
-    let latestPayment = null;
-    try {
-      const pRes = await fetch(`${host}/pg/orders/${encodeURIComponent(orderId)}/payments`, {
-        method: "GET",
-        headers: cfHeaders,
-      });
-      if (pRes.ok) {
-        const arr = await pRes.json();
-        if (Array.isArray(arr) && arr.length) {
-          latestPayment = arr.sort((a, b) => {
-            const ta = new Date(a.payment_time || a.added_on || 0).getTime();
-            const tb = new Date(b.payment_time || b.added_on || 0).getTime();
-            return tb - ta;
-          })[0];
-        }
-      }
-    } catch (_) {}
-
-    return {
-      statusCode: 200,
-      headers,
-      body: JSON.stringify({
-        order_id: order.order_id,
-        order_status: order.order_status,            // e.g. PAID / ACTIVE / EXPIRED
-        order_amount: order.order_amount,
-        order_currency: order.order_currency,
-        order_tags: order.order_tags || {},          // purpose/adId/amount (from create-order)
-        payment_status: latestPayment?.payment_status, // e.g. SUCCESS / FAILED
-        payment_amount: latestPayment?.payment_amount,
-        payment_method: latestPayment?.payment_method?.display_name || latestPayment?.payment_method,
-        cf_payment_id: latestPayment?.cf_payment_id,
-      }),
+    // Return only the useful bits to the client
+    const resp = {
+      order_id: json.order_id,
+      order_status: json.order_status,
+      cf_order_id: json.cf_order_id,
+      order_amount: json.order_amount,
+      order_currency: json.order_currency,
+      order_tags: json.order_tags || {},
+      payments: json.payments || undefined, // optional; remove if you want a smaller response
     };
+
+    return ok(resp, event);
   } catch (e) {
-    return {
-      statusCode: 500,
-      headers,
-      body: JSON.stringify({ error: "get-order failed", details: String(e?.message || e) }),
-    };
+    const status = e.statusCode || 500;
+    const message =
+      e.body?.message ||
+      e.message ||
+      "Failed to fetch order from Cashfree";
+    return bad(status, message, event);
   }
 };

@@ -1,157 +1,104 @@
-// Netlify Function: create-order
-// Creates/Upserts a Cashfree customer with your Firebase UID and then creates an order
-// Returns: { order_id, payment_session_id, cf_order } and echoes order_tags for debugging
+// netlify/functions/create-order.js
+const fetch = require("node-fetch");
 
-const ALLOWED_ORIGINS = [
-  "https://www.bechobazaar.com",
-  "https://bechobazaar.com",
-  "https://bechobazaar.netlify.app" 
-];
+const CF_ENV = process.env.CASHFREE_ENV || "production"; // "sandbox" | "production"
+const APP_ID = process.env.CASHFREE_APP_ID;
+const SECRET = process.env.CASHFREE_SECRET_KEY;
 
-const CF_ENV   = process.env.CASHFREE_ENV || "production"; // "sandbox" | "production"
-const CF_BASE  = CF_ENV === "sandbox" ? "https://sandbox.cashfree.com/pg" : "https://api.cashfree.com/pg";
-const APP_ID   = process.env.CASHFREE_APP_ID;
-const SECRET   = process.env.CASHFREE_SECRET_KEY;
-const RETURN_URL_TPL = process.env.RETURN_URL || "https://www.bechobazaar.com/account.html?cf=1&order_id={order_id}";
-const NOTIFY_URL     = process.env.CASHFREE_NOTIFY_URL || undefined;
-
-function cors(event) {
-  const origin = event.headers.origin || "";
-  const allow = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
-  const headers = {
-    "Access-Control-Allow-Origin": allow,
-    "Access-Control-Allow-Credentials": "true",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Access-Control-Allow-Methods": "OPTIONS,POST"
-  };
-  return headers;
-}
-
-function bad(status, message, headers) {
-  return { statusCode: status, headers, body: JSON.stringify({ error: message }) };
-}
-
-function requireEnv() {
-  if (!APP_ID || !SECRET) throw new Error("Cashfree credentials missing");
-}
-
-function nowOrderId() {
-  // unique, readable order id
-  const rand = Math.random().toString(36).slice(2, 8);
-  return `order_${Date.now()}_${rand}`;
-}
+// CORS: single origin only (no multi-value header)
+const ALLOWED = (process.env.ALLOWED_ORIGINS || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
+const cors = (origin) => ({
+  "Access-Control-Allow-Origin": ALLOWED.includes(origin) ? origin : (ALLOWED[0] || origin || "*"),
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+});
 
 exports.handler = async (event) => {
-  const headers = cors(event);
+  const origin = event.headers.origin || event.headers.Origin || "";
+  const headers = cors(origin);
 
   if (event.httpMethod === "OPTIONS") {
     return { statusCode: 200, headers, body: "" };
   }
   if (event.httpMethod !== "POST") {
-    return bad(405, "Method Not Allowed", headers);
+    return { statusCode: 405, headers, body: "Method Not Allowed" };
   }
 
   try {
-    requireEnv();
-
     const body = JSON.parse(event.body || "{}");
-    const { amount, currency = "INR", purpose, adId, planDays, customer } = body;
 
-    if (!amount || !purpose) return bad(400, "amount & purpose required", headers);
+    const amount   = Number(body.amount || 0);
+    const currency = String(body.currency || "INR").toUpperCase();
+    const purpose  = String(body.purpose || "post_fee");
+    const adId     = body.adId || null;
 
-    // ---- Map client customer -> Cashfree customer_details ----
-    // We always prefer your Firebase UID as the persistent customer_id
-    let customer_id = customer?.id || customer?.customer_id || null;
-    if (customer_id) customer_id = String(customer_id);
+    // **No user input needed**: hum khud defaults bhar denge
+    const rawUid = (body.customer && body.customer.id) || body.userId || "guest";
+    const custId = ("cust_" + String(rawUid)).slice(0, 40); // dashboard me "Customer Ref ID"
+    const custEmail = "pay@bechobazaar.com";                 // fixed, professional
+    const custPhone = "9999999999";                          // fixed 10-digit
 
-    const customer_email = customer?.email || "anon@example.com";
-    const customer_phone = customer?.phone || "9999999999";
-
-    // 1) Idempotent upsert the customer (ensures dashboard shows ref id instead of "guest")
-    if (customer_id) {
-      const putRes = await fetch(`${CF_BASE}/customers/${encodeURIComponent(customer_id)}`, {
-        method: "PUT",
-        headers: {
-          "x-client-id": APP_ID,
-          "x-client-secret": SECRET,
-          "x-api-version": "2022-09-01",
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          // Cashfree expects these exact keys:
-          customer_id: customer_id,
-          customer_email,
-          customer_phone
-        })
-      });
-
-      // We ignore 200/201/204 variations; but if hard error, surface it
-      if (!putRes.ok && putRes.status >= 400 && putRes.status < 500) {
-        const t = await putRes.text();
-        console.warn("Cashfree PUT /customers failed:", putRes.status, t);
-        // We can still proceed without a registered customer; order will be 'guest'
-      }
+    if (!APP_ID || !SECRET) {
+      return { statusCode: 500, headers, body: JSON.stringify({ error: "server not configured" }) };
+    }
+    if (!amount || amount < 1) {
+      return { statusCode: 400, headers, body: JSON.stringify({ error: "invalid amount" }) };
     }
 
-    // 2) Create order
-    const order_id = nowOrderId();
-
-    const order_tags = Object.fromEntries(
-      Object.entries({
-        purpose,
-        adId,
-        amount: String(amount),
-        planDays: planDays != null ? String(planDays) : undefined
-      }).filter(([_, v]) => v !== undefined)
-    );
-
-    const orderMeta = {
-      return_url: RETURN_URL_TPL.replace("{order_id}", order_id)
-    };
-    if (NOTIFY_URL) orderMeta.notify_url = NOTIFY_URL;
+    const host = CF_ENV === "sandbox" ? "https://sandbox.cashfree.com" : "https://api.cashfree.com";
+    const orderId = "order_" + Date.now();
 
     const payload = {
-      order_id,
-      order_amount: Number(amount),
+      order_id: orderId,
+      order_amount: amount,
       order_currency: currency,
-      customer_details: customer_id
-        ? { customer_id } // **THIS** makes the dashboard show your ref id
-        : { customer_email, customer_phone }, // fallback: still not "guest" sometimes, but ref id may be absent
-      order_meta: orderMeta,
-      order_tags
+      customer_details: {
+        customer_id: custId,
+        customer_email: custEmail,
+        customer_phone: custPhone,
+      },
+      order_meta: {
+        // success ke baad yahin par aaoge; {order_id} auto replace hota hai
+        return_url: `https://www.bechobazaar.com/account.html?cf=1&order_id={order_id}`,
+      },
+      // verify/resume ke liye context
+      order_tags: { purpose, adId, amount },
+      // (optional) order_note bhi daal sakte ho
+      order_note: `${purpose} for ad ${adId || "na"}`
     };
 
-    const res = await fetch(`${CF_BASE}/orders`, {
+    const res = await fetch(`${host}/pg/orders`, {
       method: "POST",
       headers: {
+        "Content-Type": "application/json",
+        "x-api-version": "2022-09-01",
         "x-client-id": APP_ID,
         "x-client-secret": SECRET,
-        "x-api-version": "2022-09-01",
-        "Content-Type": "application/json"
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
     });
 
-    const data = await res.json();
+    const text = await res.text();
     if (!res.ok) {
-      console.error("Cashfree /orders error", res.status, data);
-      return bad(res.status, data?.message || "Cashfree order error", headers);
+      return { statusCode: res.status, headers, body: text };
     }
+    const data = JSON.parse(text);
 
-    // Expected fields: payment_session_id, order_id, etc.
     return {
       statusCode: 200,
       headers,
       body: JSON.stringify({
-        order_id: data.order_id || order_id,
+        order_id: data.order_id,
         payment_session_id: data.payment_session_id,
-        cf_order: data,
-        order_tags // echo for debugging on client
-      })
+        purpose, adId, amount
+      }),
     };
   } catch (e) {
-    console.error(e);
-    return bad(500, e.message || "Server error", headers);
+    return {
+      statusCode: 500,
+      headers,
+      body: JSON.stringify({ error: "create-order failed", details: String(e?.message || e) }),
+    };
   }
 };
-

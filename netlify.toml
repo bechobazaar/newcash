@@ -1,29 +1,7 @@
-# ------ Build (no build step needed for functions-only) ------
-[build]
-  command = ""
-  publish = "public"                # optional; rakho to theek
-  # functions dir yahan bhi de sakte ho, par neeche [functions] me hum de rahe hain
-
-# ------ Functions config ------
 [functions]
-  directory = "netlify/functions"   # tumhara path
+  directory = "netlify/functions"
   node_bundler = "esbuild"
 
-# ------ Node version for functions runtime ------
 [build.environment]
   NODE_VERSION = "18"
-
-# ------ CORS: allow your frontend domain to call functions ------
-[[headers]]
-  for = "/.netlify/functions/*"
-  [headers.values]
-    Access-Control-Allow-Origin = "https://www.bechobazaar.com"
-    Access-Control-Allow-Headers = "Content-Type, Authorization"
-    Access-Control-Allow-Methods = "GET, POST, OPTIONS"
-
-# ------ (Optional) Short path: call /api/* instead of /.netlify/functions/* ------
-# [[redirects]]
-#   from = "/api/*"
-#   to = "/.netlify/functions/:splat"
-#   status = 200
 

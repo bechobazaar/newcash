@@ -5,7 +5,7 @@
 const ALLOWED_ORIGINS = [
   "https://www.bechobazaar.com",
   "https://bechobazaar.com",
-  "http://localhost:5500" // dev only; remove in prod if not needed
+  "https://bechobazaar.netlify.app" 
 ];
 
 const CF_ENV   = process.env.CASHFREE_ENV || "production"; // "sandbox" | "production"
@@ -154,3 +154,4 @@ exports.handler = async (event) => {
     return bad(500, e.message || "Server error", headers);
   }
 };
+

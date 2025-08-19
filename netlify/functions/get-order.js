@@ -4,7 +4,7 @@
 const ALLOWED_ORIGINS = [
   "https://www.bechobazaar.com",
   "https://bechobazaar.com",
-  "http://localhost:5500"
+  "https://bechobazaar.netlify.app"
 ];
 
 const CF_ENV   = process.env.CASHFREE_ENV || "production";
@@ -64,3 +64,4 @@ exports.handler = async (event) => {
     return { statusCode: 500, headers, body: JSON.stringify({ error: e.message || "Server error" }) };
   }
 };
+

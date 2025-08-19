@@ -1,104 +1,203 @@
-// netlify/functions/create-order.js
-const fetch = require("node-fetch");
+// create-order.js — Netlify Function (no fetch, uses https)
+// - Creates Cashfree order and returns { order_id, payment_session_id, ... }
+// - CORS: returns a single Access-Control-Allow-Origin based on allowlist
+// - No user email/phone required on client. We send safe placeholders here.
 
-const CF_ENV = process.env.CASHFREE_ENV || "production"; // "sandbox" | "production"
-const APP_ID = process.env.CASHFREE_APP_ID;
-const SECRET = process.env.CASHFREE_SECRET_KEY;
+const https = require("https");
+const { URL } = require("url");
 
-// CORS: single origin only (no multi-value header)
+// ====== ENV ======
+const ENV = process.env.CASHFREE_ENV === "sandbox" ? "sandbox" : "production";
+const CF_HOST = ENV === "sandbox" ? "sandbox.cashfree.com" : "api.cashfree.com";
+const CF_ORDERS_PATH = "/pg/orders";
+const CF_APP_ID = process.env.CASHFREE_APP_ID || "";
+const CF_SECRET = process.env.CASHFREE_SECRET_KEY || "";
+const RETURN_URL = process.env.RETURN_URL || "https://www.bechobazaar.com/account.html?cf=true&order_id={order_id}";
 const ALLOWED = (process.env.ALLOWED_ORIGINS || "")
-  .split(",").map(s => s.trim()).filter(Boolean);
-const cors = (origin) => ({
-  "Access-Control-Allow-Origin": ALLOWED.includes(origin) ? origin : (ALLOWED[0] || origin || "*"),
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
-});
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+// ====== CORS helpers ======
+function pickOrigin(event) {
+  const reqOrigin =
+    event.headers?.origin ||
+    event.headers?.Origin ||
+    event.headers?.ORIGIN ||
+    "";
+  if (ALLOWED.includes(reqOrigin)) return reqOrigin;
+  // no matching origin, return first allowlisted (or empty to omit)
+  return ALLOWED[0] || "";
+}
+
+function corsHeaders(event) {
+  const allowOrigin = pickOrigin(event);
+  const base = {
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  };
+  // set a single value only
+  if (allowOrigin) base["Access-Control-Allow-Origin"] = allowOrigin;
+  return base;
+}
+
+function ok(body, event) {
+  return {
+    statusCode: 200,
+    headers: corsHeaders(event),
+    body: JSON.stringify(body),
+  };
+}
+
+function bad(status, msg, event) {
+  return {
+    statusCode: status,
+    headers: corsHeaders(event),
+    body: JSON.stringify({ error: msg }),
+  };
+}
+
+// ====== tiny https client ======
+function httpsJSON({ host, path, method = "GET", headers = {}, bodyObj }) {
+  const bodyStr = bodyObj ? JSON.stringify(bodyObj) : null;
+
+  const opts = {
+    host,
+    path,
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-version": "2022-09-01",
+      ...headers,
+    },
+  };
+  if (bodyStr) {
+    opts.headers["Content-Length"] = Buffer.byteLength(bodyStr);
+  }
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(opts, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        try {
+          const json = data ? JSON.parse(data) : {};
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(json);
+          } else {
+            const err = new Error(
+              `CF ${method} ${path} ${res.statusCode}: ${data}`
+            );
+            err.statusCode = res.statusCode;
+            err.body = json;
+            reject(err);
+          }
+        } catch (e) {
+          e.message = `CF parse error: ${e.message} :: ${data}`;
+          reject(e);
+        }
+      });
+    });
+    req.on("error", reject);
+    if (bodyStr) req.write(bodyStr);
+    req.end();
+  });
+}
+
+// ====== util ======
+function genOrderId(prefix = "bb") {
+  // unique-ish: bb_<timestamp>_<rand4>
+  const r = Math.random().toString(36).slice(2, 6);
+  return `${prefix}_${Date.now()}_${r}`;
+}
 
 exports.handler = async (event) => {
-  const origin = event.headers.origin || event.headers.Origin || "";
-  const headers = cors(origin);
-
+  // CORS preflight
   if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 200, headers, body: "" };
+    return { statusCode: 200, headers: corsHeaders(event), body: "" };
   }
+
   if (event.httpMethod !== "POST") {
-    return { statusCode: 405, headers, body: "Method Not Allowed" };
+    return bad(405, "Method Not Allowed", event);
   }
+
+  // Check Cashfree creds
+  if (!CF_APP_ID || !CF_SECRET) {
+    return bad(500, "Cashfree credentials missing on server", event);
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(event.body || "{}");
+  } catch (_) {
+    return bad(400, "Invalid JSON", event);
+  }
+
+  // Read client inputs (no email/phone required from user)
+  const amount = Number(payload.amount);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return bad(400, "amount must be a positive number", event);
+  }
+
+  const currency = (payload.currency || "INR").toUpperCase();
+  const purpose = String(payload.purpose || "");
+  const adId = payload.adId ? String(payload.adId) : "";
+
+  // We prefer a stable customer_id (uid) when available
+  const customer = payload.customer || {};
+  const customerId = String(customer.id || "guest");
+
+  // server-side safe placeholders so user does NOT need to enter details
+  const customerEmail = "guest@bechobazaar.com";
+  const customerPhone = "9999999999";
+
+  // generate our own order_id (recommended)
+  const orderId = genOrderId("bb");
+
+  // Build CF order body
+  const cfBody = {
+    order_id: orderId,
+    order_amount: amount,
+    order_currency: currency,
+    customer_details: {
+      customer_id: customerId,
+      customer_email: customerEmail,
+      customer_phone: customerPhone,
+    },
+    order_meta: {
+      return_url: RETURN_URL, // Cashfree will replace {order_id}
+      // notify_url: "...", // (optional) if you add a webhook
+    },
+    // Tags help your frontend resume the right flow after redirect
+    order_tags: {
+      purpose: purpose || "boost",
+      adId: adId || "",
+      amount: String(amount),
+      // If you also send planDays from client, include it here:
+      planDays: payload.planDays ? String(payload.planDays) : "",
+    },
+  };
 
   try {
-    const body = JSON.parse(event.body || "{}");
-
-    const amount   = Number(body.amount || 0);
-    const currency = String(body.currency || "INR").toUpperCase();
-    const purpose  = String(body.purpose || "post_fee");
-    const adId     = body.adId || null;
-
-    // **No user input needed**: hum khud defaults bhar denge
-    const rawUid = (body.customer && body.customer.id) || body.userId || "guest";
-    const custId = ("cust_" + String(rawUid)).slice(0, 40); // dashboard me "Customer Ref ID"
-    const custEmail = "pay@bechobazaar.com";                 // fixed, professional
-    const custPhone = "9999999999";                          // fixed 10-digit
-
-    if (!APP_ID || !SECRET) {
-      return { statusCode: 500, headers, body: JSON.stringify({ error: "server not configured" }) };
-    }
-    if (!amount || amount < 1) {
-      return { statusCode: 400, headers, body: JSON.stringify({ error: "invalid amount" }) };
-    }
-
-    const host = CF_ENV === "sandbox" ? "https://sandbox.cashfree.com" : "https://api.cashfree.com";
-    const orderId = "order_" + Date.now();
-
-    const payload = {
-      order_id: orderId,
-      order_amount: amount,
-      order_currency: currency,
-      customer_details: {
-        customer_id: custId,
-        customer_email: custEmail,
-        customer_phone: custPhone,
-      },
-      order_meta: {
-        // success ke baad yahin par aaoge; {order_id} auto replace hota hai
-        return_url: `https://www.bechobazaar.com/account.html?cf=1&order_id={order_id}`,
-      },
-      // verify/resume ke liye context
-      order_tags: { purpose, adId, amount },
-      // (optional) order_note bhi daal sakte ho
-      order_note: `${purpose} for ad ${adId || "na"}`
-    };
-
-    const res = await fetch(`${host}/pg/orders`, {
+    const json = await httpsJSON({
+      host: CF_HOST,
+      path: CF_ORDERS_PATH,
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        "x-api-version": "2022-09-01",
-        "x-client-id": APP_ID,
-        "x-client-secret": SECRET,
+        "x-client-id": CF_APP_ID,
+        "x-client-secret": CF_SECRET,
       },
-      body: JSON.stringify(payload),
+      bodyObj: cfBody,
     });
 
-    const text = await res.text();
-    if (!res.ok) {
-      return { statusCode: res.status, headers, body: text };
-    }
-    const data = JSON.parse(text);
-
-    return {
-      statusCode: 200,
-      headers,
-      body: JSON.stringify({
-        order_id: data.order_id,
-        payment_session_id: data.payment_session_id,
-        purpose, adId, amount
-      }),
-    };
+    // expected: { order_id, payment_session_id, ... }
+    return ok(json, event);
   } catch (e) {
-    return {
-      statusCode: 500,
-      headers,
-      body: JSON.stringify({ error: "create-order failed", details: String(e?.message || e) }),
-    };
+    const status = e.statusCode || 500;
+    const message =
+      e.body?.message ||
+      e.message ||
+      "Failed to create order with Cashfree";
+    return bad(status, message, event);
   }
 };

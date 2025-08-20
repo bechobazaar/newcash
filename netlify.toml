@@ -1,13 +1,9 @@
 [build]
-  publish = "."
-  command = ""
+  functions = "netlify/functions"
 
 [functions]
-  directory = "netlify/functions"
   node_bundler = "esbuild"
-
-[build.environment]
-  NODE_VERSION = "18"
+  external_node_modules = ["firebase-admin"]
 
 [[scheduled.functions]]
   function = "bump-ads"

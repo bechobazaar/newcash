@@ -1,0 +1,9 @@
+{
+  "name": "bechobazaar-functions",
+  "private": true,
+  "type": "commonjs",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "firebase-admin": "^11.11.1"
+  }
+}

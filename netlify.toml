@@ -8,3 +8,7 @@
 
 [build.environment]
   NODE_VERSION = "18"
+
+[[scheduled.functions]]
+  function = "bump-ads"
+  cron = "0 * * * *" # every hour

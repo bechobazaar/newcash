@@ -1,10 +1,10 @@
 [build]
-  functions = "netlify/functions"
+  publish = "."
+  command = ""
 
 [functions]
+  directory = "netlify/functions"
   node_bundler = "esbuild"
-  external_node_modules = ["firebase-admin"]
 
-[[scheduled.functions]]
-  function = "bump-ads"
-  cron = "0 * * * *" # every hour
+[build.environment]
+  NODE_VERSION = "18"

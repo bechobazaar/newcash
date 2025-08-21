@@ -1,0 +1,12 @@
+{
+  "name": "bechobazaar-functions",
+  "private": true,
+  "version": "1.0.0",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "googleapis": "^131.0.0"
+  }
+}

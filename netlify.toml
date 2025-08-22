@@ -1,10 +1,12 @@
 [build]
-  publish = "."
-  command = ""
+  publish = "."                    # jahan se index.html serve hoga
+  functions = "netlify/functions"  # <-- yahi sahi jagah hai
+  command = ""                     # (agar build step nahi hai to khali chhodo)
 
 [functions]
-  directory = "netlify/functions"
-  node_bundler = "esbuild"
+  node_bundler = "esbuild"         # auto-bundle for Functions
+  # included_files = []            # (optional)
+  # external_node_modules = []     # (optional)
 
 [build.environment]
   NODE_VERSION = "18"

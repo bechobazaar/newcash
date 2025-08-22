@@ -1,22 +1,46 @@
-// /.netlify/functions/send-push.js
-// Node 18+ => global fetch available. No node-fetch needed.
+// Node 18+: global fetch available
+
+const headers = (origin) => ({
+  'Access-Control-Allow-Origin': origin || '*',        // optionally lock down below
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Max-Age': '86400',
+  'Content-Type': 'application/json'
+});
+
+function isAllowedOrigin(origin) {
+  // Optional allowlist via env: e.g. "https://bechobazaar.netlify.app,https://bechobazaar.com"
+  const allow = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (allow.length === 0) return origin || '*'; // no allowlist => reflect or wildcard
+  return allow.includes(origin) ? origin : null;
+}
 
 exports.handler = async (event) => {
   try {
-    if (event.httpMethod !== 'POST') {
-      return { statusCode: 405, body: 'Method Not Allowed' };
+    const origin = isAllowedOrigin(event.headers?.origin);
+    const baseHeaders = headers(origin);
+
+    // 1) Preflight
+    if (event.httpMethod === 'OPTIONS') {
+      return { statusCode: 200, headers: baseHeaders, body: JSON.stringify({ ok: true }) };
     }
 
+    // 2) Only POST allowed
+    if (event.httpMethod !== 'POST') {
+      return { statusCode: 405, headers: baseHeaders, body: JSON.stringify({ error: 'Method Not Allowed' }) };
+    }
+
+    // 3) Parse body
     const { tokens = [], title, body, url = '/', icon, badge, tag = 'bechobazaar', data = {} } =
       JSON.parse(event.body || '{}');
 
     if (!Array.isArray(tokens) || tokens.length === 0) {
-      return { statusCode: 400, body: 'No tokens' };
+      return { statusCode: 400, headers: baseHeaders, body: JSON.stringify({ error: 'No tokens' }) };
     }
 
     const SERVER_KEY = process.env.FCM_SERVER_KEY;
     if (!SERVER_KEY) {
-      return { statusCode: 500, body: 'FCM_SERVER_KEY missing' };
+      return { statusCode: 500, headers: baseHeaders, body: JSON.stringify({ error: 'FCM_SERVER_KEY missing' }) };
     }
 
     const payload = {
@@ -42,8 +66,9 @@ exports.handler = async (event) => {
     });
 
     const json = await res.json();
-    return { statusCode: res.ok ? 200 : 500, body: JSON.stringify(json) };
+    return { statusCode: res.ok ? 200 : 500, headers: baseHeaders, body: JSON.stringify(json) };
   } catch (e) {
-    return { statusCode: 500, body: e.message || 'Error' };
+    const origin = isAllowedOrigin(null);
+    return { statusCode: 500, headers: headers(origin), body: JSON.stringify({ error: e.message || 'Error' }) };
   }
 };

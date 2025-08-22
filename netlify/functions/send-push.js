@@ -1,38 +1,80 @@
+// /.netlify/functions/send-push.js
 // Node 18+: global fetch available
 
-const headers = (origin) => ({
-  'Access-Control-Allow-Origin': origin || '*',        // optionally lock down below
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+const VERSION = 'send-push@2025-08-22-12-25IST';
+
+const makeHeaders = (origin) => ({
+  'Access-Control-Allow-Origin': origin || '*',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS, GET',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   'Access-Control-Max-Age': '86400',
-  'Content-Type': 'application/json'
+  'Content-Type': 'application/json',
+  'X-Func-Version': VERSION
 });
 
-function isAllowedOrigin(origin) {
-  // Optional allowlist via env: e.g. "https://bechobazaar.netlify.app,https://bechobazaar.com"
-  const allow = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-  if (allow.length === 0) return origin || '*'; // no allowlist => reflect or wildcard
-  return allow.includes(origin) ? origin : null;
+function pickOrigin(event) {
+  const reqOrigin = event.headers?.origin || '';
+  const allow = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  if (allow.length === 0) return reqOrigin || '*';
+  return allow.includes(reqOrigin) ? reqOrigin : allow[0]; // reflect first allowed to keep CORS happy
 }
 
 exports.handler = async (event) => {
+  const origin = pickOrigin(event);
+  const baseHeaders = makeHeaders(origin);
+
+  // Always tell which method we saw
+  const method = event.httpMethod || '';
+
   try {
-    const origin = isAllowedOrigin(event.headers?.origin);
-    const baseHeaders = headers(origin);
-
-    // 1) Preflight
-    if (event.httpMethod === 'OPTIONS') {
-      return { statusCode: 200, headers: baseHeaders, body: JSON.stringify({ ok: true }) };
+    // 1) OPTIONS (CORS preflight)
+    if (method === 'OPTIONS') {
+      return {
+        statusCode: 200,
+        headers: baseHeaders,
+        body: JSON.stringify({ ok: true, method, note: 'preflight' })
+      };
     }
 
-    // 2) Only POST allowed
-    if (event.httpMethod !== 'POST') {
-      return { statusCode: 405, headers: baseHeaders, body: JSON.stringify({ error: 'Method Not Allowed' }) };
+    // 2) TEMP: GET to verify function is reachable (helps kill “405 loop” confusion)
+    if (method === 'GET') {
+      return {
+        statusCode: 200,
+        headers: baseHeaders,
+        body: JSON.stringify({
+          ok: true,
+          method,
+          version: VERSION,
+          how: 'Use POST with JSON body to send pushes to FCM.'
+        })
+      };
     }
 
-    // 3) Parse body
-    const { tokens = [], title, body, url = '/', icon, badge, tag = 'bechobazaar', data = {} } =
-      JSON.parse(event.body || '{}');
+    // 3) Only POST for real work
+    if (method !== 'POST') {
+      return {
+        statusCode: 405,
+        headers: baseHeaders,
+        body: JSON.stringify({ error: 'Method Not Allowed', method })
+      };
+    }
+
+    // 4) Parse body
+    let bodyJson = {};
+    try { bodyJson = JSON.parse(event.body || '{}'); } catch (e) {}
+    const {
+      tokens = [],
+      title,
+      body,
+      url = '/',
+      icon,
+      badge,
+      tag = 'bechobazaar',
+      data = {}
+    } = bodyJson;
 
     if (!Array.isArray(tokens) || tokens.length === 0) {
       return { statusCode: 400, headers: baseHeaders, body: JSON.stringify({ error: 'No tokens' }) };
@@ -43,6 +85,7 @@ exports.handler = async (event) => {
       return { statusCode: 500, headers: baseHeaders, body: JSON.stringify({ error: 'FCM_SERVER_KEY missing' }) };
     }
 
+    // 5) Build FCM payload
     const payload = {
       registration_ids: tokens,
       notification: {
@@ -56,6 +99,7 @@ exports.handler = async (event) => {
       webpush: { fcm_options: { link: url } }
     };
 
+    // 6) Send to FCM
     const res = await fetch('https://fcm.googleapis.com/fcm/send', {
       method: 'POST',
       headers: {
@@ -66,9 +110,16 @@ exports.handler = async (event) => {
     });
 
     const json = await res.json();
-    return { statusCode: res.ok ? 200 : 500, headers: baseHeaders, body: JSON.stringify(json) };
+    return {
+      statusCode: res.ok ? 200 : 500,
+      headers: baseHeaders,
+      body: JSON.stringify({ ok: res.ok, fcm: json, version: VERSION })
+    };
   } catch (e) {
-    const origin = isAllowedOrigin(null);
-    return { statusCode: 500, headers: headers(origin), body: JSON.stringify({ error: e.message || 'Error' }) };
+    return {
+      statusCode: 500,
+      headers: baseHeaders,
+      body: JSON.stringify({ error: e.message || 'Error', version: VERSION })
+    };
   }
 };

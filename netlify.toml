@@ -8,3 +8,8 @@
 
 [build.environment]
   NODE_VERSION = "18"
+
+# 🚀 Autobump function har ghante chalega
+[[scheduled.functions]]
+  name = "autobump"
+  cron = "0 * * * *"

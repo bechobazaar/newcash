@@ -1,6 +1,5 @@
-// /.netlify/functions/send-push
-// Uses FCM legacy HTTP API with SERVER_KEY (env var) — client key kabhi expose mat karna.
-const fetch = (...a) => import('node-fetch').then(({default: f}) => f(...a));
+// /.netlify/functions/send-push.js
+// Node 18+ => global fetch available. No node-fetch needed.
 
 exports.handler = async (event) => {
   try {
@@ -8,7 +7,8 @@ exports.handler = async (event) => {
       return { statusCode: 405, body: 'Method Not Allowed' };
     }
 
-    const { tokens = [], title, body, url = '/', icon, badge, tag = 'bechobazaar', data = {} } = JSON.parse(event.body || '{}');
+    const { tokens = [], title, body, url = '/', icon, badge, tag = 'bechobazaar', data = {} } =
+      JSON.parse(event.body || '{}');
 
     if (!Array.isArray(tokens) || tokens.length === 0) {
       return { statusCode: 400, body: 'No tokens' };
@@ -28,13 +28,8 @@ exports.handler = async (event) => {
         badge: badge || '/badge-72.png',
         tag
       },
-      data: {
-        ...data,
-        url // SW will open this
-      },
-      webpush: {
-        fcm_options: { link: url }
-      }
+      data: { ...data, url },
+      webpush: { fcm_options: { link: url } }
     };
 
     const res = await fetch('https://fcm.googleapis.com/fcm/send', {

@@ -8,17 +8,3 @@
 
 [build.environment]
   NODE_VERSION = "18"
-
-[[plugins]]
-  package = "@netlify/plugin-functions-install-core"
-
-# Service worker must be served as-is
-[[redirects]]
-  from = "/firebase-messaging-sw.js"
-  to = "/firebase-messaging-sw.js"
-  status = 200
-
-[[headers]]
-  for = "/firebase-messaging-sw.js"
-  [headers.values]
-    Cache-Control = "no-cache"

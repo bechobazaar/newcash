@@ -1,15 +1,24 @@
 [build]
-  publish = "."                    # jahan se index.html serve hoga
-  functions = "netlify/functions"  # <-- yahi sahi jagah hai
-  command = ""                     # (agar build step nahi hai to khali chhodo)
+  publish = "."
+  command = ""
 
 [functions]
-  node_bundler = "esbuild"         # auto-bundle for Functions
-  # included_files = []            # (optional)
-  # external_node_modules = []     # (optional)
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
 
 [build.environment]
   NODE_VERSION = "18"
 
 [[plugins]]
   package = "@netlify/plugin-functions-install-core"
+
+# Service worker must be served as-is
+[[redirects]]
+  from = "/firebase-messaging-sw.js"
+  to = "/firebase-messaging-sw.js"
+  status = 200
+
+[[headers]]
+  for = "/firebase-messaging-sw.js"
+  [headers.values]
+    Cache-Control = "no-cache"

@@ -1,74 +1,54 @@
-// netlify/functions/send-push.js
-const FCM_ENDPOINT = 'https://fcm.googleapis.com/fcm/send';
-
-// Allowed origins (same-origin + optional prod domain)
-const ALLOWED = new Set([
-  'https://bechobazaar.netlify.app',
-  'https://www.bechobazaar.com',     // (अगर कभी yahan se call karo)
-  'http://localhost:8888',           // netlify dev (optional)
-  'http://localhost:3000'            // local dev (optional)
-]);
-
-function corsHeaders(origin) {
-  const allow = ALLOWED.has(origin) ? origin : 'https://bechobazaar.netlify.app';
-  return {
-    'Access-Control-Allow-Origin': allow,
-    'Vary': 'Origin',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS, GET',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Max-Age': '86400'
-  };
-}
+// /.netlify/functions/send-push
+// Uses FCM legacy HTTP API with SERVER_KEY (env var) — client key kabhi expose mat karna.
+const fetch = (...a) => import('node-fetch').then(({default: f}) => f(...a));
 
 exports.handler = async (event) => {
-  const origin = event.headers.origin || '';
-  const CORS = corsHeaders(origin);
-
-  // CORS preflight
-  if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: CORS, body: '' };
-  }
-
-  // Health check
-  if (event.httpMethod === 'GET') {
-    return { statusCode: 200, headers: CORS, body: 'send-push OK' };
-  }
-
   try {
-    const { tokens, title, body, url, icon, badge, tag } = JSON.parse(event.body || '{}');
-    if (!Array.isArray(tokens) || tokens.length === 0) {
-      return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: 'No tokens' }) };
+    if (event.httpMethod !== 'POST') {
+      return { statusCode: 405, body: 'Method Not Allowed' };
     }
 
-    // de-dupe + clean
-    const regIds = [...new Set(tokens)].filter(Boolean);
+    const { tokens = [], title, body, url = '/', icon, badge, tag = 'bechobazaar', data = {} } = JSON.parse(event.body || '{}');
+
+    if (!Array.isArray(tokens) || tokens.length === 0) {
+      return { statusCode: 400, body: 'No tokens' };
+    }
+
+    const SERVER_KEY = process.env.FCM_SERVER_KEY;
+    if (!SERVER_KEY) {
+      return { statusCode: 500, body: 'FCM_SERVER_KEY missing' };
+    }
 
     const payload = {
-      registration_ids: regIds,
-      priority: 'high',
-      time_to_live: 2419200,
+      registration_ids: tokens,
       notification: {
-        title,
-        body,
-        icon: icon || '/logo-192.png',
+        title: title || 'New message',
+        body:  body  || '',
+        icon:  icon  || '/logo-192.png',
         badge: badge || '/badge-72.png',
-        tag:   tag   || 'chat'
+        tag
       },
-      data: { title, body, url: url || '/chat-list.html', icon, badge, tag }
+      data: {
+        ...data,
+        url // SW will open this
+      },
+      webpush: {
+        fcm_options: { link: url }
+      }
     };
 
-    const r = await fetch(FCM_ENDPOINT, {
+    const res = await fetch('https://fcm.googleapis.com/fcm/send', {
       method: 'POST',
       headers: {
-        'Authorization': `key=${process.env.FCM_SERVER_KEY}`, // 🔑 Netlify env var
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'Authorization': `key=${SERVER_KEY}`
       },
       body: JSON.stringify(payload)
     });
 
-    const text = await r.text();
-    return { statusCode: r.status, headers: CORS, body: text };
+    const json = await res.json();
+    return { statusCode: res.ok ? 200 : 500, body: JSON.stringify(json) };
   } catch (e) {
-    return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: e.message || 'Error' }) };
+    return { statusCode: 500, body: e.message || 'Error' };
   }
 };

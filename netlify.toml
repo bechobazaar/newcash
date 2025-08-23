@@ -10,7 +10,7 @@
 [build.environment]
   NODE_VERSION = "18"
 
-[[functions]]
+[[scheduled]]
   name = "autobump"
-  schedule = "*/5 * * * *"   # run every 5 minutes
+  schedule = "*/5 * * * *"   # every 5 minutes (ya 10/min as you prefer)
 

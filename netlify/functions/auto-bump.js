@@ -53,6 +53,7 @@ function initAdmin() {
 
   appInited = true;
 }
+exports.config = { schedule: "*/10 * * * *" }; // every 10 minutes (UTC)
 
 exports.handler = async function () {
   try {

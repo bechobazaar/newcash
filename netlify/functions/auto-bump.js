@@ -29,7 +29,6 @@ function initAdmin() {
     const projectId   = process.env.FIREBASE_PROJECT_ID;
     const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
 
-    // Either plain key or base64 variant
     let privateKey = process.env.FIREBASE_PRIVATE_KEY || "";
     const privateKeyB64 = process.env.FIREBASE_PRIVATE_KEY_B64;
     if (!privateKey && privateKeyB64) {
@@ -53,6 +52,7 @@ function initAdmin() {
 
   appInited = true;
 }
+
 exports.config = { schedule: "*/10 * * * *" }; // every 10 minutes (UTC)
 
 exports.handler = async function () {
@@ -74,24 +74,70 @@ exports.handler = async function () {
     }
 
     const batch = db.batch();
+    let bumped = 0;
+    let notified = 0;
 
     snap.docs.forEach((doc) => {
       const it = doc.data() || {};
       const b  = it.boost || {};
       const freq = Number(b.frequencyMins || 180); // default 3h
 
-      const newPriority = Math.floor(Date.now() / 1000); // seconds epoch
-      const nextAt = admin.firestore.Timestamp.fromMillis(Date.now() + freq * 60 * 1000);
+      // Compute next schedule + bump counters
+      const nowMs = Date.now();
+      const nextAt = admin.firestore.Timestamp.fromMillis(nowMs + freq * 60 * 1000);
+      const newPriority = Math.floor(nowMs / 1000);           // seconds epoch
+      const bumpCount   = Number(b.bumpCount || 0) + 1;       // keep a running count
 
+      // 1) Update item
       batch.update(doc.ref, {
         priorityScore: newPriority,
-        "boost.bumpAt": now,
-        "boost.nextAt": nextAt,
+        "boost.bumpAt": now,                // when bumped (server time)
+        "boost.nextAt": nextAt,             // next schedule
+        "boost.bumpCount": bumpCount        // optional running counter
       });
+      bumped++;
+
+      // 2) Create notification for owner (if we can find owner id)
+      const ownerId =
+        it.userId || it.ownerId || it.uid || it.sellerId || null;
+
+      if (ownerId) {
+        // Try to pick a thumbnail
+        let imageUrl = null;
+        if (Array.isArray(it.images) && it.images.length) {
+          const first = it.images[0];
+          imageUrl =
+            (typeof first === "string" && first) ||
+            first?.url || first?.src || null;
+        }
+        imageUrl = imageUrl || it.imageUrl || it.thumbnail || it.cover || null;
+
+        const title = it.title || it.name || "Your ad";
+        const plan  = b.plan || b.planCode || b.name || "";
+
+        const notifRef = db.collection("notifications").doc();
+        batch.set(notifRef, {
+          adId: doc.id,
+          userId: ownerId,
+          adminName: "AutoBump Service",
+          imageUrl: imageUrl || null,
+          message: `Your ad "${title}" was auto-bumped.`,
+          type: "autobump",
+          seen: false,
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          bump: {
+            plan: String(plan || ""),
+            bumpNo: bumpCount
+          },
+          // Deep link to your item page (adjust if your route differs)
+          targetUrl: `/item.html?id=${encodeURIComponent(doc.id)}`
+        });
+        notified++;
+      }
     });
 
     await batch.commit();
-    return { statusCode: 200, body: `Bumped ${snap.size} ads` };
+    return { statusCode: 200, body: `Bumped ${bumped} ads, notifications ${notified}` };
   } catch (e) {
     console.error(e);
     return { statusCode: 500, body: "Auto-bump error: " + e.message };

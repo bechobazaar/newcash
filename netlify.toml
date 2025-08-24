@@ -1,5 +1,5 @@
 [build]
-  publish = "public"
+  publish = "."
   command = ""
 
 [functions]
@@ -8,4 +8,5 @@
 
 [build.environment]
   NODE_VERSION = "18"
+
 

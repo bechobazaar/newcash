@@ -3,14 +3,8 @@
   command = ""
 
 [functions]
+  directory = "netlify/functions"
   node_bundler = "esbuild"
-  included_files = ["netlify/functions/_firebaseAdmin.js"]
-
 
 [build.environment]
   NODE_VERSION = "18"
-
-[[scheduled]]
-  name = "autobump"
-  schedule = "*/5 * * * *"   # every 5 minutes (ya 10/min as you prefer)
-

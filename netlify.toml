@@ -9,4 +9,9 @@
 [build.environment]
   NODE_VERSION = "18"
 
+[[scheduled.functions]]
+  name = "bump-featured-ads"
+  cron = "*/10 * * * *"  
+
+
 

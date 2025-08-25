@@ -40,7 +40,7 @@ function initAdmin() {
 
 exports.config = { schedule: "*/10 * * * *" }; // every 10 minutes (UTC)
 
-// Helper: normalize Firestore value to millis (handles number or Timestamp)
+// Normalize to millis (handles number or Firestore Timestamp)
 function toMillis(v) {
   if (!v) return 0;
   if (typeof v === "number") return v;
@@ -55,16 +55,18 @@ exports.handler = async () => {
     const db = admin.firestore();
     const nowMs = Date.now();
 
-    // Match your schema: root fields + ms epoch
-    const snap = await db
+    // ✅ NESTED QUERY (matches your schema)
+    const q = db
       .collection("items")
-      .where("active", "==", true)
-      .where("nextBumpAt", "<=", nowMs) // single range -> no composite index needed
-      .limit(200)
-      .get();
+      .where("boost.active", "==", true)
+      .where("boost.nextBumpAt", "<=", nowMs)
+      .limit(200);
+
+    const snap = await q.get();
+    console.log("[auto-bump] due docs:", snap.size);
 
     if (snap.empty) {
-      return { statusCode: 200, body: "No due items." };
+      return { statusCode: 200, body: "No due boosts." };
     }
 
     const batch = db.batch();
@@ -73,32 +75,36 @@ exports.handler = async () => {
 
     snap.docs.forEach((doc) => {
       const it = doc.data() || {};
+      const b = it.boost || {};
 
-      // Skip if boost window ended
-      const endAtMs = toMillis(it.endAt);
-      if (endAtMs && endAtMs <= nowMs) return;
+      // Window guard
+      const endAtMs = toMillis(b.endAt);
+      if (endAtMs && endAtMs <= nowMs) {
+        console.log(`[auto-bump] skip expired`, doc.id);
+        return;
+      }
 
-      // Frequency (mins) default 180; can be stored at root or inside boost
-      const freqMins = Number(it.frequencyMins ?? it.boost?.frequencyMins ?? 180);
+      const freqMins = Number(b.frequencyMins ?? 180);
       const nextMs = nowMs + freqMins * 60 * 1000;
 
-      // Update root fields (your schema)
+      // ✅ Updates INSIDE boost (nested paths)
       batch.update(doc.ref, {
-        lastBumpedAt: nowMs,
-        nextBumpAt: nextMs,
-        bumpCount: admin.firestore.FieldValue.increment(1),
-        priorityScore: Math.floor(nowMs / 1000), // seconds epoch
+        "boost.lastBumpedAt": nowMs,
+        "boost.nextBumpAt": nextMs,
+        "boost.bumpCount": admin.firestore.FieldValue.increment(1),
+        // Optional root field for sorting
+        priorityScore: Math.floor(nowMs / 1000),
       });
       bumped++;
 
-      // Optional notification
+      // 🔔 Notification (optional)
       const ownerId = it.userId || it.ownerId || it.uid || it.sellerId || null;
       if (ownerId) {
+        // pick an image
         let imageUrl = null;
         if (Array.isArray(it.images) && it.images.length) {
           const first = it.images[0];
-          imageUrl =
-            (typeof first === "string" && first) || first?.url || first?.src || null;
+          imageUrl = (typeof first === "string" && first) || first?.url || first?.src || null;
         }
         imageUrl = imageUrl || it.imageUrl || it.thumbnail || it.cover || null;
 
@@ -112,7 +118,7 @@ exports.handler = async () => {
           type: "autobump",
           seen: false,
           timestamp: admin.firestore.FieldValue.serverTimestamp(),
-          bump: { plan: String(it.plan || it.boost?.plan || "") },
+          bump: { plan: String(b.plan || "") },
           targetUrl: `/item.html?id=${encodeURIComponent(doc.id)}`,
         });
         notified++;
@@ -120,10 +126,8 @@ exports.handler = async () => {
     });
 
     await batch.commit();
-    return {
-      statusCode: 200,
-      body: `Bumped ${bumped}, notifications ${notified}`,
-    };
+    console.log(`[auto-bump] done. bumped=${bumped}, notified=${notified}`);
+    return { statusCode: 200, body: `Bumped ${bumped}, notifications ${notified}` };
   } catch (e) {
     console.error(e);
     return { statusCode: 500, body: "Auto-bump error: " + e.message };

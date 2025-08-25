@@ -40,14 +40,16 @@ function initAdmin() {
 
 exports.config = { schedule: "*/10 * * * *" }; // every 10 minutes (UTC)
 
-// Normalize to millis (handles number or Firestore Timestamp)
+// --- helpers ---
 function toMillis(v) {
   if (!v) return 0;
   if (typeof v === "number") return v;
+  if (typeof v === "string") return Number(v) || 0;
   if (v.toMillis) return v.toMillis();
   if (v._seconds != null) return v._seconds * 1000 + Math.floor((v._nanoseconds || 0) / 1e6);
-  return Number(v) || 0;
+  return 0;
 }
+function mins(n) { return n * 60 * 1000; }
 
 exports.handler = async () => {
   try {
@@ -55,52 +57,65 @@ exports.handler = async () => {
     const db = admin.firestore();
     const nowMs = Date.now();
 
-    // ✅ NESTED QUERY (matches your schema)
-    const q = db
-      .collection("items")
-      .where("boost.active", "==", true)
+    // 🔍 Query only on boost.nextBumpAt to avoid composite index requirement
+    const snap = await db.collection("items")
       .where("boost.nextBumpAt", "<=", nowMs)
-      .limit(200);
+      .limit(200)
+      .get();
 
-    const snap = await q.get();
-    console.log("[auto-bump] due docs:", snap.size);
-
+    console.log("[auto-bump] Fetched candidates:", snap.size);
     if (snap.empty) {
-      return { statusCode: 200, body: "No due boosts." };
+      return { statusCode: 200, body: "No due candidates." };
     }
 
     const batch = db.batch();
-    let bumped = 0;
-    let notified = 0;
+    let bumped = 0, notified = 0, skipped = 0;
 
     snap.docs.forEach((doc) => {
       const it = doc.data() || {};
-      const b = it.boost || {};
+      const b  = it.boost || {};
 
-      // Window guard
-      const endAtMs = toMillis(b.endAt);
-      if (endAtMs && endAtMs <= nowMs) {
-        console.log(`[auto-bump] skip expired`, doc.id);
-        return;
+      const active = !!b.active;
+      const endAt  = toMillis(b.endAt);
+      const nextAt = toMillis(b.nextBumpAt);
+
+      // code-side guards matching your data model
+      if (!active) { skipped++; return; }
+      if (endAt && endAt <= nowMs) { skipped++; return; }
+      if (!nextAt || nextAt > nowMs) { skipped++; return; }
+
+      // Optional caps (if you use them)
+      const maxBumps = Number(b.maxBumps || 0);
+      const currentBumps = Number(b.bumpCount || 0);
+      if (maxBumps > 0 && currentBumps >= maxBumps) { skipped++; return; }
+
+      // Frequency:
+      // 1) boost.frequencyMins if provided
+      // 2) else derive from bumpsPerDay (e.g., 1 -> 1440 mins)
+      // 3) else default 180 mins
+      let freqMins = Number(b.frequencyMins || 0);
+      if (!freqMins) {
+        const perDay = Number(b.bumpsPerDay || 0);
+        if (perDay > 0) freqMins = Math.max(1, Math.floor(1440 / perDay));
       }
+      if (!freqMins) freqMins = 180;
 
-      const freqMins = Number(b.frequencyMins ?? 180);
-      const nextMs = nowMs + freqMins * 60 * 1000;
+      const nextMs = nowMs + mins(freqMins);
 
       // ✅ Updates INSIDE boost (nested paths)
       batch.update(doc.ref, {
         "boost.lastBumpedAt": nowMs,
         "boost.nextBumpAt": nextMs,
         "boost.bumpCount": admin.firestore.FieldValue.increment(1),
-        // Optional root field for sorting
+        // helpful root field for sorting lists
         priorityScore: Math.floor(nowMs / 1000),
       });
       bumped++;
 
-      // 🔔 Notification (optional)
+      // 🔔 Optional notification (if you store owner id)
       const ownerId = it.userId || it.ownerId || it.uid || it.sellerId || null;
       if (ownerId) {
-        // pick an image
+        // best-effort image
         let imageUrl = null;
         if (Array.isArray(it.images) && it.images.length) {
           const first = it.images[0];
@@ -125,9 +140,15 @@ exports.handler = async () => {
       }
     });
 
+    if (bumped === 0) {
+      console.log(`[auto-bump] Nothing to bump. skipped=${skipped}`);
+      return { statusCode: 200, body: `No bumps. Skipped ${skipped}.` };
+    }
+
     await batch.commit();
-    console.log(`[auto-bump] done. bumped=${bumped}, notified=${notified}`);
-    return { statusCode: 200, body: `Bumped ${bumped}, notifications ${notified}` };
+    console.log(`[auto-bump] done. bumped=${bumped}, notified=${notified}, skipped=${skipped}`);
+    return { statusCode: 200, body: `Bumped ${bumped}, notifications ${notified}, skipped ${skipped}` };
+
   } catch (e) {
     console.error(e);
     return { statusCode: 500, body: "Auto-bump error: " + e.message };

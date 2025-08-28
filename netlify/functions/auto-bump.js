@@ -56,8 +56,9 @@ exports.handler = async () => {
     initAdmin();
     const db = admin.firestore();
     const nowMs = Date.now();
+    const DAY = 24 * 60 * 60 * 1000;
 
-    // 🔍 Query only on boost.nextBumpAt to avoid composite index requirement
+    // Query: anything due to bump now
     const snap = await db.collection("items")
       .where("boost.nextBumpAt", "<=", nowMs)
       .limit(200)
@@ -78,44 +79,76 @@ exports.handler = async () => {
       const active = !!b.active;
       const endAt  = toMillis(b.endAt);
       const nextAt = toMillis(b.nextBumpAt);
+      const plan   = String(b.plan || "29");
 
-      // code-side guards matching your data model
+      // guards
       if (!active) { skipped++; return; }
-      if (endAt && endAt <= nowMs) { skipped++; return; }
+      if (endAt && endAt <= nowMs) { // boost expired
+        // clean nextBumpAt so it doesn't keep reappearing
+        batch.update(doc.ref, { "boost.nextBumpAt": null });
+        skipped++;
+        return;
+      }
       if (!nextAt || nextAt > nowMs) { skipped++; return; }
 
-      // Optional caps (if you use them)
+      // Optional global caps
       const maxBumps = Number(b.maxBumps || 0);
       const currentBumps = Number(b.bumpCount || 0);
       if (maxBumps > 0 && currentBumps >= maxBumps) { skipped++; return; }
 
-      // Frequency:
-      // 1) boost.frequencyMins if provided
-      // 2) else derive from bumpsPerDay (e.g., 1 -> 1440 mins)
-      // 3) else default 180 mins
-      let freqMins = Number(b.frequencyMins || 0);
-      if (!freqMins) {
-        const perDay = Number(b.bumpsPerDay || 0);
-        if (perDay > 0) freqMins = Math.max(1, Math.floor(1440 / perDay));
-      }
-      if (!freqMins) freqMins = 180;
-
-      const nextMs = nowMs + mins(freqMins);
-
-      // ✅ Updates INSIDE boost (nested paths)
-      batch.update(doc.ref, {
+      // === PLAN-SPECIFIC SCHEDULING ===
+      const updates = {
         "boost.lastBumpedAt": nowMs,
-        "boost.nextBumpAt": nextMs,
         "boost.bumpCount": admin.firestore.FieldValue.increment(1),
         // helpful root field for sorting lists
         priorityScore: Math.floor(nowMs / 1000),
-      });
+      };
+
+      if (plan === "49") {
+        // Weekly cadence, total 2 bumps in 15 days using bumpBudget
+        const budget = Number(b.bumpBudget ?? 0);
+
+        if (budget <= 0) {
+          // no budget left — stop further bumps
+          updates["boost.nextBumpAt"] = null;
+          // don't count as a bump since we didn't bump; revert bumpCount increment
+          delete updates["boost.bumpCount"];
+          // still write once to clear nextBumpAt
+          batch.update(doc.ref, updates);
+          skipped++;
+          return;
+        }
+
+        // consume 1 budget
+        updates["boost.bumpBudget"] = admin.firestore.FieldValue.increment(-1);
+
+        // schedule next weekly bump if budget remains and within window
+        const nextWeekly = nowMs + 7 * DAY;
+        const willHaveBudgetAfter = budget - 1 > 0;
+        const withinWindow = !endAt || nextWeekly < endAt;
+
+        updates["boost.nextBumpAt"] = (willHaveBudgetAfter && withinWindow) ? nextWeekly : null;
+
+      } else {
+        // Existing logic for daily (99) or others using bumpsPerDay/frequencyMins
+        let freqMins = Number(b.frequencyMins || 0);
+        if (!freqMins) {
+          const perDay = Number(b.bumpsPerDay || 0);
+          if (perDay > 0) freqMins = Math.max(1, Math.floor(1440 / perDay));
+        }
+        if (!freqMins) freqMins = 180; // default backoff
+
+        const nextMs = nowMs + mins(freqMins);
+        // don't schedule past end
+        updates["boost.nextBumpAt"] = (endAt && nextMs >= endAt) ? null : nextMs;
+      }
+
+      batch.update(doc.ref, updates);
       bumped++;
 
-      // 🔔 Optional notification (if you store owner id)
+      // 🔔 Optional notification
       const ownerId = it.userId || it.ownerId || it.uid || it.sellerId || null;
       if (ownerId) {
-        // best-effort image
         let imageUrl = null;
         if (Array.isArray(it.images) && it.images.length) {
           const first = it.images[0];
@@ -133,7 +166,7 @@ exports.handler = async () => {
           type: "autobump",
           seen: false,
           timestamp: admin.firestore.FieldValue.serverTimestamp(),
-          bump: { plan: String(b.plan || "") },
+          bump: { plan },
           targetUrl: `/item.html?id=${encodeURIComponent(doc.id)}`,
         });
         notified++;

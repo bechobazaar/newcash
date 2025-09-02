@@ -1,4 +1,3 @@
-// netlify/functions/notify-on-new-message.js
 const admin = require('firebase-admin');
 
 function readServiceAccount() {
@@ -8,7 +7,6 @@ function readServiceAccount() {
   if (obj.private_key) obj.private_key = obj.private_key.replace(/\\n/g, '\n');
   return obj;
 }
-
 if (!admin.apps.length) {
   const svc = readServiceAccount();
   admin.initializeApp({
@@ -21,30 +19,23 @@ if (!admin.apps.length) {
 }
 const db = admin.firestore();
 
+// CORS: allow your real frontend origin(s)
 const ALLOWED_ORIGINS = [
-  'https://bechobazaar.com',
-  'https://www.bechobazaar.com',
-  process.env.APP_BASE_URL
+  process.env.APP_BASE_URL,                  // e.g., https://bechobazaar.com
+  'https://bechobazaar.com'              // add if you serve on www also
 ].filter(Boolean);
 
 function pickOrigin(event) {
   const h = event.headers || {};
-  const origin = h.origin || h.Origin || (h.host ? `https://${h.host}` : '');
-  return ALLOWED_ORIGINS.includes(origin)
-    ? origin
-    : (process.env.APP_BASE_URL || ALLOWED_ORIGINS[0] || '').replace(/\/$/, '');
+  const origin = h.origin || h.Origin || '';
+  return ALLOWED_ORIGINS.includes(origin) ? origin : (ALLOWED_ORIGINS[0] || '*');
 }
-
-function chunk(arr, size) {
-  const out = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
-}
+function chunk(a,n){const o=[];for(let i=0;i<a.length;i+=n)o.push(a.slice(i,i+n));return o;}
 
 exports.handler = async (event) => {
   const ORIGIN = pickOrigin(event);
   const cors = {
-    'Access-Control-Allow-Origin': ORIGIN || '*',
+    'Access-Control-Allow-Origin': ORIGIN,
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
   };
@@ -52,22 +43,21 @@ exports.handler = async (event) => {
   if (event.httpMethod !== 'POST') return { statusCode: 405, headers: cors, body: 'Method Not Allowed' };
 
   try {
-    // Auth
     const authHeader = event.headers.authorization || event.headers.Authorization || '';
     if (!authHeader.startsWith('Bearer ')) return { statusCode: 401, headers: cors, body: 'Missing auth token' };
     const idToken = authHeader.slice(7);
     const decoded = await admin.auth().verifyIdToken(idToken);
 
-    // Body
-    let payload; try { payload = JSON.parse(event.body || '{}'); }
+    let body; try { body = JSON.parse(event.body || '{}'); }
     catch { return { statusCode: 400, headers: cors, body: 'Invalid JSON body' }; }
-    const { chatId, messageId } = payload || {};
+
+    const { chatId, messageId } = body || {};
     if (!chatId || !messageId) return { statusCode: 400, headers: cors, body: 'chatId and messageId required' };
 
-    // Chat + Message
     const chatRef = db.collection('chats').doc(chatId);
     const chatDoc = await chatRef.get();
     if (!chatDoc.exists) return { statusCode: 404, headers: cors, body: 'Chat not found' };
+
     const users = chatDoc.get('users') || [];
     if (!users.includes(decoded.uid)) return { statusCode: 403, headers: cors, body: 'Not in chat' };
 
@@ -75,24 +65,21 @@ exports.handler = async (event) => {
     if (!msgSnap.exists) return { statusCode: 404, headers: cors, body: 'Message not found' };
     const m = msgSnap.data() || {};
 
-    // Recipients (exclude sender)
     const recipients = users.filter(u => u !== m.senderId);
     if (!recipients.length) return { statusCode: 200, headers: cors, body: JSON.stringify({ sent: 0, failed: 0 }) };
 
-    // Collect tokens (new schema preferred: field.token; fallback: doc.id)
     const tokenHolders = [];
     for (const uid of recipients) {
       const qs = await db.collection('users').doc(uid).collection('fcmTokens').get();
       qs.forEach(d => {
         const data = d.data() || {};
-        const token = data.token || d.id;
+        const token = data.token || d.id; // support legacy
         if (token) tokenHolders.push({ token, ref: d.ref });
       });
     }
     if (!tokenHolders.length) return { statusCode: 200, headers: cors, body: JSON.stringify({ sent: 0, failed: 0 }) };
 
-    // Build notification
-    const siteOrigin = (ORIGIN || process.env.APP_BASE_URL || 'https://bechobazaar.com').replace(/\/$/, '');
+    const siteOrigin = (process.env.APP_BASE_URL || 'https://bechobazaar.com').replace(/\/$/,'');
     const link = `${siteOrigin}/chat.html?chatId=${encodeURIComponent(chatId)}`;
     const bodyText = (m.text && m.text.trim()) || (m.imageUrl ? '📷 Photo' : 'New message');
 
@@ -100,37 +87,28 @@ exports.handler = async (event) => {
       notification: { title: 'New message', body: bodyText },
       data: { chatId, senderId: String(m.senderId || ''), messageId },
       android: { priority: 'high' },
-      webpush: {
-        fcmOptions: { link },
-        notification: { badge: '/icons/badge-72.png', icon: '/icons/icon-192.png' },
-      },
+      webpush: { fcmOptions: { link }, notification: { badge: '/icons/badge-72.png', icon: '/icons/icon-192.png' } },
     };
 
-    // Send in batches + cleanup definitely-bad tokens
-    let success = 0, failed = 0;
+    let success=0, failed=0;
     for (const slice of chunk(tokenHolders, 500)) {
-      const tokens = slice.map(t => t.token);
-      const res = await admin.messaging().sendEachForMulticast({ tokens, ...base });
+      const res = await admin.messaging().sendEachForMulticast({ tokens: slice.map(t=>t.token), ...base });
       success += res.successCount; failed += res.failureCount;
-
-      res.responses.forEach((r, idx) => {
+      res.responses.forEach((r,i)=>{
         if (!r.success) {
           const code = r.error?.code || '';
-          if (
-            code.includes('registration-token-not-registered') ||
-            code.includes('messaging/registration-token-not-registered') ||
-            code.includes('invalid-argument') ||
-            code.includes('mismatch-sender-id')
-          ) {
-            slice[idx].ref.delete().catch(() => {});
+          if (code.includes('registration-token-not-registered') ||
+              code.includes('messaging/registration-token-not-registered') ||
+              code.includes('invalid-argument') ||
+              code.includes('mismatch-sender-id')) {
+            slice[i].ref.delete().catch(()=>{});
           }
         }
       });
     }
-
     return { statusCode: 200, headers: cors, body: JSON.stringify({ sent: success, failed }) };
   } catch (err) {
-    console.error('notify-on-new-message error', err);
+    console.error(err);
     return { statusCode: 500, headers: cors, body: 'Internal Server Error' };
   }
 };

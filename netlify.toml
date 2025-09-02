@@ -1,3 +1,9 @@
+[[redirects]]
+  from = "/.netlify/functions/*"
+  to   = "/.netlify/functions/:splat"
+  status = 200
+  force = true
+
 [build]
   publish = "."
   command = ""
@@ -25,3 +31,4 @@
 # (optional) If you actually have this function
 [functions."auto-bump"]
   schedule = "*/10 * * * *"   # every 10 minutes (UTC)
+

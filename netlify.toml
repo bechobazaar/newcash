@@ -9,8 +9,19 @@
 [build.environment]
   NODE_VERSION = "18"
 
+# ❗ Service Worker: no cache (reliably picks updates)
+[[headers]]
+  for = "/firebase-messaging-sw.js"
+  [headers.values]
+    Cache-Control = "no-store"
+
+# ❗ Ensure SW isn't swallowed by SPA redirect (serve the actual file)
+[[redirects]]
+  from = "/firebase-messaging-sw.js"
+  to = "/firebase-messaging-sw.js"
+  status = 200
+  force = true
+
+# (optional) If you actually have this function
 [functions."auto-bump"]
   schedule = "*/10 * * * *"   # every 10 minutes (UTC)
-
-
-

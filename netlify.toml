@@ -9,13 +9,13 @@
 [build.environment]
   NODE_VERSION = "18"
 
-# Service Worker: always serve latest
+# Service Worker: always latest content
 [[headers]]
   for = "/firebase-messaging-sw.js"
   [headers.values]
     Cache-Control = "no-store"
 
-# Serve SW as-is (not caught by SPA)
+# Serve SW as-is (not swallowed by SPA rules)
 [[redirects]]
   from = "/firebase-messaging-sw.js"
   to   = "/firebase-messaging-sw.js"
@@ -25,3 +25,4 @@
 # (optional) only if the file exists
 [functions."auto-bump"]
   schedule = "*/10 * * * *"
+

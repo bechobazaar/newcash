@@ -9,27 +9,19 @@
 [build.environment]
   NODE_VERSION = "18"
 
-# ✅ Always serve Functions as Functions (NOT SPA)
-#   Keep this ABOVE any /* -> /index.html rules (if you have them).
-[[redirects]]
-  from = "/.netlify/functions/*"
-  to   = "/.netlify/functions/:splat"
-  status = 200
-  force = true
-
-# ✅ Service Worker: no cache (always pick latest)
+# Service Worker: always serve latest
 [[headers]]
   for = "/firebase-messaging-sw.js"
   [headers.values]
     Cache-Control = "no-store"
 
-# ✅ Make sure SW is served as-is (not caught by SPA)
+# Serve SW as-is (not caught by SPA)
 [[redirects]]
   from = "/firebase-messaging-sw.js"
   to   = "/firebase-messaging-sw.js"
   status = 200
   force = true
 
-# (optional) if you actually have this function file present
+# (optional) only if the file exists
 [functions."auto-bump"]
-  schedule = "*/10 * * * *"   # every 10 minutes (UTC)
+  schedule = "*/10 * * * *"

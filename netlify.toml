@@ -9,26 +9,25 @@
 [build.environment]
   NODE_VERSION = "18"
 
-# ✅ Make sure functions aren't swallowed by SPA redirect
+# ✅ Friendly alias for functions
 [[redirects]]
-  from = "/.netlify/functions/*"
+  from = "/api/*"
   to   = "/.netlify/functions/:splat"
   status = 200
-  force = true
 
-# Service worker: always fetch fresh
+# 🛡️ Service worker: always fetch fresh
 [[headers]]
   for = "/firebase-messaging-sw.js"
   [headers.values]
     Cache-Control = "no-store"
 
-# Serve SW file directly (no SPA rewrite)
+# SW file should bypass SPA rewrites
 [[redirects]]
   from = "/firebase-messaging-sw.js"
   to   = "/firebase-messaging-sw.js"
   status = 200
   force = true
 
+# (optional) keep only if you have this function file
 [functions."auto-bump"]
-  schedule = "*/10 * * * *"   # every 10 minutes (UTC)
-
+  schedule = "*/10 * * * *"

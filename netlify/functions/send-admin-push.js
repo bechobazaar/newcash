@@ -1,84 +1,152 @@
-/* global importScripts, firebase, self, clients */
-importScripts('https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js');
-importScripts('https://www.gstatic.com/firebasejs/8.10.0/firebase-messaging.js');
+// netlify/functions/send-admin-push.js
+const crypto = require('crypto');
+const admin = require('firebase-admin');
 
-firebase.initializeApp({
-  apiKey: "AIzaSyBknD854PogHpSh12VEVOFobZTG5q1o4_Y",
-  authDomain: "olxhub-12479.firebaseapp.com",
-  databaseURL: "https://olxhub-12479-default-rtdb.firebaseio.com",
-  projectId: "olxhub-12479",
-  storageBucket: "olxhub-12479.appspot.com",
-  messagingSenderId: "470888578176",
-  appId: "1:470888578176:web:5f24b2dba3eebd39cefa65",
-  measurementId: "G-FDNWXBM2MY"
-});
+function readServiceAccount() {
+  const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_B64;
+  if (!b64) throw new Error('Missing FIREBASE_SERVICE_ACCOUNT_B64');
+  const obj = JSON.parse(Buffer.from(b64.trim(), 'base64').toString('utf8'));
+  if (obj.private_key) obj.private_key = obj.private_key.replace(/\\n/g, '\n');
+  return obj;
+}
 
-const messaging = firebase.messaging();
-const FIXED_TITLE = 'New message received';
-
-/**
- * Background handler (app बंद/closed)
- * - adminPush: title/body/image दिखेगा, क्लिक पर data.link खुलेगा
- * - chat default: सिर्फ fixed title, body खाली; क्लिक पर chat-list खुलेगा
- */
-messaging.setBackgroundMessageHandler((payload) => {
-  const data = payload.data || {};
-
-  // ---- ADMIN PUSH ----
-  if (data.type === 'adminPush') {
-    const n = payload.notification || {};
-    const title = n.title || 'BechoBazaar';
-    const body  = n.body  || '';
-    const image = n.image || data.imageUrl || null;
-
-    const options = {
-      body,
-      icon: '/icons/icon-192.png',
-      badge: '/icons/badge-72.png',
-      data: { ...data, link: data.link || '/' },
-      vibrate: [70, 30, 70],
-      tag: 'admin-push',
-      renotify: true,
-      ...(image ? { image } : {})
-    };
-    return self.registration.showNotification(title, options);
-  }
-
-  // ---- CHAT (privacy: no snippet) ----
-  return self.registration.showNotification(FIXED_TITLE, {
-    body: '',
-    icon: '/icons/icon-192.png',
-    badge: '/icons/badge-72.png',
-    data: data || {},
-    vibrate: [60, 25, 60],
-    tag: data.chatId ? `chat-${data.chatId}` : 'chat',
-    renotify: true
+if (!admin.apps.length) {
+  const svc = readServiceAccount();
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: svc.project_id || svc.projectId,
+      clientEmail: svc.client_email || svc.clientEmail,
+      privateKey: svc.private_key || svc.privateKey,
+    }),
   });
-});
+}
 
-/**
- * Notification click
- * - adminPush ⇒ data.link (absolute/relative दोनों चलेंगे)
- * - chat default ⇒ हमेशा /chat-list.html
- */
-self.addEventListener('notificationclick', (event) => {
-  event.notification.close();
+const db = admin.firestore();
 
-  const d = (event.notification && event.notification.data) || {};
-  let target;
+const ALLOWED_ORIGINS = [
+  'https://bechobazaar.com',
+  'https://www.bechobazaar.com',
+  'https://bechobazaar.netlify.app',
+  'https://bechobazzar.com',         // (user requested target link)
+  'https://www.bechobazzar.com',
+  'http://localhost:3000',
+  process.env.APP_BASE_URL
+].filter(Boolean);
 
-  if (d.type === 'adminPush' && d.link) {
-    target = d.link;                         // e.g. https://bechobazaar.com/sale or /some/page
-  } else {
-    target = '/chat-list.html';              // always open chat list for chat pushes
+function buildCORS(event){
+  const hdr = event.headers || {};
+  const rawOrigin = hdr.origin || hdr.Origin || '';
+  const isNull = !rawOrigin || rawOrigin === 'null';
+  // we already require X-Admin-Key, so wildcard for null-origin is acceptable
+  const allowOrigin = ALLOWED_ORIGINS.includes(rawOrigin) ? rawOrigin : (isNull ? '*' : '*');
+  return {
+    'Access-Control-Allow-Origin': allowOrigin,
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Admin-Key',
+    'Access-Control-Max-Age': '86400',
+    'Vary': 'Origin'
+  };
+}
+
+function timingSafeEqual(a, b) {
+  const A = Buffer.from(String(a || ''), 'utf8');
+  const B = Buffer.from(String(b || ''), 'utf8');
+  if (A.length !== B.length) return false;
+  try { return crypto.timingSafeEqual(A, B); } catch { return false; }
+}
+
+exports.handler = async (event) => {
+  const CORS = buildCORS(event);
+
+  // Preflight
+  if (event.httpMethod === 'OPTIONS') {
+    return { statusCode: 204, headers: CORS, body: '' };
+  }
+  if (event.httpMethod !== 'POST') {
+    return { statusCode: 405, headers: CORS, body: 'Method Not Allowed' };
   }
 
-  // focus existing tab if already open, else open new
-  event.waitUntil((async () => {
-    const all = await clients.matchAll({ type: 'window', includeUncontrolled: true });
-    for (const c of all) {
-      if (c.url.includes(target) && 'focus' in c) return c.focus();
+  try {
+    // ---- No-signin admin auth via X-Admin-Key ----
+    const headerKey = event.headers['x-admin-key'] || event.headers['X-Admin-Key'];
+    const envKey = process.env.ADMIN_PUSH_KEY || '';
+    if (!envKey || !headerKey || !timingSafeEqual(headerKey, envKey)) {
+      return { statusCode: 401, headers: CORS, body: 'Unauthorized' };
     }
-    return clients.openWindow(target);
-  })());
-});
+
+    // ---- Parse body ----
+    let body;
+    try { body = JSON.parse(event.body || '{}'); }
+    catch { return { statusCode: 400, headers: CORS, body: 'Invalid JSON body' }; }
+
+    const title   = (body.title || '').toString().trim();
+    const message = (body.message || '').toString();
+    const image   = (body.image || body.imageUrl || '').toString().trim() || null;
+    const link    = (body.link || 'https://bechobazzar.com/').toString().trim(); // default target
+    const audience = (body.audience || 'all').toString();
+    const uids = Array.isArray(body.uids) ? body.uids : [];
+
+    if (!title) return { statusCode: 400, headers: CORS, body: 'title required' };
+
+    // ---- Collect tokens ----
+    let tokenRefs = [];
+    async function addUserTokens(uid) {
+      const qs = await db.collection('users').doc(uid).collection('fcmTokens').get();
+      qs.forEach(d => tokenRefs.push({ token: d.id, ref: d.ref }));
+    }
+
+    if (audience === 'uids' && uids.length) {
+      for (const uid of uids) await addUserTokens(uid);
+    } else {
+      // broadcast to all tokens
+      const cg = await db.collectionGroup('fcmTokens').get();
+      tokenRefs = cg.docs.map(d => ({ token: d.id, ref: d.ref }));
+    }
+
+    if (!tokenRefs.length) {
+      return { statusCode: 200, headers: CORS, body: JSON.stringify({ sent: 0, failed: 0, tokens: 0 }) };
+    }
+
+    // ---- Build payload ----
+    const base = {
+      notification: { title, body: message, ...(image ? { image } : {}) },
+      data: { type: 'adminPush', link, ...(image ? { imageUrl: image } : {}) },
+      android: { priority: 'high' },
+      webpush: {
+        fcmOptions: { link },
+        headers: { Urgency: 'high' },
+        notification: {
+          title, body: message,
+          icon: '/icons/icon-192.png',
+          badge: '/icons/badge-72.png',
+          ...(image ? { image } : {})
+        }
+      }
+    };
+
+    // ---- Send in batches + cleanup bad tokens ----
+    let success = 0, failed = 0;
+    for (let i = 0; i < tokenRefs.length; i += 500) {
+      const slice = tokenRefs.slice(i, i + 500);
+      const tokens = slice.map(t => t.token);
+      const res = await admin.messaging().sendEachForMulticast({ tokens, ...base });
+      success += res.successCount; failed += res.failureCount;
+
+      res.responses.forEach((r, idx) => {
+        if (!r.success) {
+          const code = r.error?.code || '';
+          if (code.includes('registration-token-not-registered') ||
+              code.includes('messaging/registration-token-not-registered') ||
+              code.includes('invalid-argument')) {
+            slice[idx].ref.delete().catch(() => {});
+          }
+        }
+      });
+    }
+
+    return { statusCode: 200, headers: CORS, body: JSON.stringify({ sent: success, failed, tokens: tokenRefs.length }) };
+  } catch (err) {
+    console.error('send-admin-push error', err);
+    return { statusCode: 500, headers: CORS, body: 'Internal Server Error' };
+  }
+};

@@ -1,4 +1,3 @@
-// netlify/functions/list-admin-push-logs.js
 const crypto = require('crypto');
 const admin = require('firebase-admin');
 
@@ -11,19 +10,20 @@ function readServiceAccount() {
 }
 if (!admin.apps.length) {
   const svc = readServiceAccount();
-  admin.initializeApp({ credential: admin.credential.cert({
-    projectId: svc.project_id || svc.projectId,
-    clientEmail: svc.client_email || svc.clientEmail,
-    privateKey: svc.private_key || svc.privateKey,
-  })});
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: svc.project_id || svc.projectId,
+      clientEmail: svc.client_email || svc.clientEmail,
+      privateKey: svc.private_key || svc.privateKey,
+    }),
+  });
 }
 const db = admin.firestore();
 
-function buildCORS(event){
-  const hdr = event.headers || {};
-  const rawOrigin = hdr.origin || hdr.Origin || '';
+function cors(event){
+  const o = event.headers.origin || event.headers.Origin || '*';
   return {
-    'Access-Control-Allow-Origin': rawOrigin || '*',
+    'Access-Control-Allow-Origin': o || '*',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Key',
     'Access-Control-Max-Age': '86400',
@@ -38,7 +38,7 @@ function timingSafeEqual(a, b) {
 }
 
 exports.handler = async (event) => {
-  const CORS = buildCORS(event);
+  const CORS = cors(event);
   if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: CORS, body: '' };
   if (event.httpMethod !== 'POST')   return { statusCode: 405, headers: CORS, body: 'Method Not Allowed' };
 
@@ -54,17 +54,13 @@ exports.handler = async (event) => {
     const limit = Math.max(1, Math.min(50, parseInt(args.limit || 20, 10)));
     const beforeMs = args.beforeMs ? parseInt(args.beforeMs, 10) : null;
 
-    let q = db.collection('adminPushLogs').orderBy('createdAt', 'desc').limit(limit);
-    if (beforeMs) {
-      q = q.where('createdAt', '<', admin.firestore.Timestamp.fromMillis(beforeMs))
-           .orderBy('createdAt', 'desc')
-           .limit(limit);
-    }
-    const snap = await q.get();
+    // Use createdAtMs (number) for reliable ordering without index hassle
+    let q = db.collection('adminPushLogs').orderBy('createdAtMs', 'desc').limit(limit);
+    if (beforeMs) q = db.collection('adminPushLogs').where('createdAtMs','<', beforeMs).orderBy('createdAtMs','desc').limit(limit);
 
+    const snap = await q.get();
     const items = snap.docs.map(d => {
       const data = d.data() || {};
-      const ts = data.createdAt && data.createdAt.toMillis ? data.createdAt.toMillis() : null;
       return {
         id: d.id,
         title: data.title || '',
@@ -78,13 +74,12 @@ exports.handler = async (event) => {
         tokens: data.tokens || 0,
         removedBadTokens: data.removedBadTokens || 0,
         detailsSample: Array.isArray(data.detailsSample) ? data.detailsSample : [],
-        createdAtMs: ts
+        createdAtMs: data.createdAtMs || (data.createdAt && data.createdAt.toMillis ? data.createdAt.toMillis() : null)
       };
     });
 
-    const nextBeforeMs = items.length ? items[items.length - 1].createdAtMs : null;
-
-    return { statusCode: 200, headers: CORS, body: JSON.stringify({ items, nextBeforeMs }) };
+    const nextBefore = items.length ? items[items.length - 1].createdAtMs : null;
+    return { statusCode: 200, headers: CORS, body: JSON.stringify({ items, nextBeforeMs: nextBefore }) };
   } catch (e) {
     console.error('list-admin-push-logs error', e);
     return { statusCode: 500, headers: CORS, body: 'Internal Server Error' };

@@ -1,3 +1,4 @@
+// netlify/functions/notify-on-new-message.js
 const admin = require('firebase-admin');
 
 function readServiceAccount() {
@@ -77,24 +78,27 @@ exports.handler = async (event) => {
       const qs = await db.collection('users').doc(uid).collection('fcmTokens').get();
       qs.forEach(d => tokenDocs.push({ token: d.id, ref: d.ref }));
     }
-    if (!tokenDocs.length) return { statusCode: 200, headers: cors, body: JSON.stringify({ sent: 0, failed: 0, recipients, tokens: 0 }) };
+    if (!tokenDocs.length) {
+      return { statusCode: 200, headers: cors, body: JSON.stringify({ sent: 0, failed: 0, recipients, tokens: 0 }) };
+    }
 
+    // Always open chat list
     const siteOrigin = (ORIGIN || process.env.APP_BASE_URL || 'https://bechobazaar.com').replace(/\/$/, '');
-    const link = `${siteOrigin}/chat.html?chatId=${encodeURIComponent(chatId)}`;
+    const link = `${siteOrigin}/chat-list.html`;
 
     const FIXED_TITLE = 'New message received';
 
     const base = {
-      // Android fallback + Safari/Mac
-      notification: { title: FIXED_TITLE, body: '' },     // ✅ koi snippet nahi
-      // Data for SW click handling
+      // Android/iOS/Safari fallback
+      notification: { title: FIXED_TITLE, body: '' }, // no snippet
+      // Data for SW
       data: { chatId, senderId: String(m.senderId || ''), messageId, link },
       android: { priority: 'high' },
       webpush: {
-        fcmOptions: { link },
+        fcmOptions: { link }, // Chrome default click target
         notification: {
           title: FIXED_TITLE,
-          body: '',                                       // ✅
+          body: '',            // no snippet
           icon: '/icons/icon-192.png',
           badge: '/icons/badge-72.png'
         },
@@ -102,14 +106,14 @@ exports.handler = async (event) => {
       }
     };
 
-    // Send in batches
+    // Send in batches (clean invalid tokens)
     let success = 0, failed = 0;
     for (let i = 0; i < tokenDocs.length; i += 500) {
       const slice = tokenDocs.slice(i, i + 500);
       const tokens = slice.map(t => t.token);
       const res = await admin.messaging().sendEachForMulticast({ tokens, ...base });
       success += res.successCount; failed += res.failureCount;
-      // Clean invalid tokens
+
       res.responses.forEach((r, idx) => {
         if (!r.success) {
           const code = r.error?.code || '';

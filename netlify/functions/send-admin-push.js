@@ -27,7 +27,7 @@ const ALLOWED_ORIGINS = [
   'https://bechobazaar.com',
   'https://www.bechobazaar.com',
   'https://bechobazaar.netlify.app',
-  'https://bechobazzar.com',         // (user requested target link)
+  'https://bechobazzar.com',
   'https://www.bechobazzar.com',
   'http://localhost:3000',
   process.env.APP_BASE_URL
@@ -37,7 +37,6 @@ function buildCORS(event){
   const hdr = event.headers || {};
   const rawOrigin = hdr.origin || hdr.Origin || '';
   const isNull = !rawOrigin || rawOrigin === 'null';
-  // we already require X-Admin-Key, so wildcard for null-origin is acceptable
   const allowOrigin = ALLOWED_ORIGINS.includes(rawOrigin) ? rawOrigin : (isNull ? '*' : '*');
   return {
     'Access-Control-Allow-Origin': allowOrigin,
@@ -58,23 +57,18 @@ function timingSafeEqual(a, b) {
 exports.handler = async (event) => {
   const CORS = buildCORS(event);
 
-  // Preflight
-  if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: CORS, body: '' };
-  }
-  if (event.httpMethod !== 'POST') {
-    return { statusCode: 405, headers: CORS, body: 'Method Not Allowed' };
-  }
+  if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: CORS, body: '' };
+  if (event.httpMethod !== 'POST')   return { statusCode: 405, headers: CORS, body: 'Method Not Allowed' };
 
   try {
-    // ---- No-signin admin auth via X-Admin-Key ----
+    // Auth via X-Admin-Key
     const headerKey = event.headers['x-admin-key'] || event.headers['X-Admin-Key'];
     const envKey = process.env.ADMIN_PUSH_KEY || '';
     if (!envKey || !headerKey || !timingSafeEqual(headerKey, envKey)) {
       return { statusCode: 401, headers: CORS, body: 'Unauthorized' };
     }
 
-    // ---- Parse body ----
+    // Body
     let body;
     try { body = JSON.parse(event.body || '{}'); }
     catch { return { statusCode: 400, headers: CORS, body: 'Invalid JSON body' }; }
@@ -82,32 +76,37 @@ exports.handler = async (event) => {
     const title   = (body.title || '').toString().trim();
     const message = (body.message || '').toString();
     const image   = (body.image || body.imageUrl || '').toString().trim() || null;
-    const link    = (body.link || 'https://bechobazzar.com/').toString().trim(); // default target
+    const link    = (body.link || 'https://bechobazzar.com/').toString().trim();
     const audience = (body.audience || 'all').toString();
     const uids = Array.isArray(body.uids) ? body.uids : [];
-
     if (!title) return { statusCode: 400, headers: CORS, body: 'title required' };
 
-    // ---- Collect tokens ----
+    // Collect tokens
     let tokenRefs = [];
     async function addUserTokens(uid) {
       const qs = await db.collection('users').doc(uid).collection('fcmTokens').get();
       qs.forEach(d => tokenRefs.push({ token: d.id, ref: d.ref }));
     }
-
     if (audience === 'uids' && uids.length) {
       for (const uid of uids) await addUserTokens(uid);
     } else {
-      // broadcast to all tokens
       const cg = await db.collectionGroup('fcmTokens').get();
       tokenRefs = cg.docs.map(d => ({ token: d.id, ref: d.ref }));
     }
-
-    if (!tokenRefs.length) {
-      return { statusCode: 200, headers: CORS, body: JSON.stringify({ sent: 0, failed: 0, tokens: 0 }) };
+    const totalTokens = tokenRefs.length;
+    if (!totalTokens) {
+      // Still log the attempt
+      const logRef = await db.collection('adminPushLogs').add({
+        title, message, image: image || null, link, audience,
+        uids: uids.slice(0,1000), // cap
+        sent: 0, failed: 0, tokens: 0, removedBadTokens: 0,
+        detailsSample: [],
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return { statusCode: 200, headers: CORS, body: JSON.stringify({ sent:0, failed:0, tokens:0, logId: logRef.id }) };
     }
 
-    // ---- Build payload ----
+    // Build FCM payload
     const base = {
       notification: { title, body: message, ...(image ? { image } : {}) },
       data: { type: 'adminPush', link, ...(image ? { imageUrl: image } : {}) },
@@ -124,8 +123,9 @@ exports.handler = async (event) => {
       }
     };
 
-    // ---- Send in batches + cleanup bad tokens ----
-    let success = 0, failed = 0;
+    // Send & gather details (sample)
+    let success = 0, failed = 0, removedBadTokens = 0;
+    const detailsSample = []; // keep first 100
     for (let i = 0; i < tokenRefs.length; i += 500) {
       const slice = tokenRefs.slice(i, i + 500);
       const tokens = slice.map(t => t.token);
@@ -133,18 +133,40 @@ exports.handler = async (event) => {
       success += res.successCount; failed += res.failureCount;
 
       res.responses.forEach((r, idx) => {
+        const det = {
+          ok: r.success,
+          code: r.error?.code || null,
+          msg: r.error?.message || null,
+          token: slice[idx].token
+        };
+        if (detailsSample.length < 100) detailsSample.push(det);
+
         if (!r.success) {
           const code = r.error?.code || '';
           if (code.includes('registration-token-not-registered') ||
               code.includes('messaging/registration-token-not-registered') ||
               code.includes('invalid-argument')) {
+            removedBadTokens++;
             slice[idx].ref.delete().catch(() => {});
           }
         }
       });
     }
 
-    return { statusCode: 200, headers: CORS, body: JSON.stringify({ sent: success, failed, tokens: tokenRefs.length }) };
+    // Write log
+    const logDoc = {
+      title, message, image: image || null, link, audience,
+      uids: uids.slice(0,1000),
+      sent: success,
+      failed: failed,
+      tokens: totalTokens,
+      removedBadTokens,
+      detailsSample,  // up to 100 items with ok/code/msg/token
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    const logRef = await db.collection('adminPushLogs').add(logDoc);
+
+    return { statusCode: 200, headers: CORS, body: JSON.stringify({ sent: success, failed, tokens: totalTokens, logId: logRef.id }) };
   } catch (err) {
     console.error('send-admin-push error', err);
     return { statusCode: 500, headers: CORS, body: 'Internal Server Error' };

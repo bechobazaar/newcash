@@ -1,4 +1,4 @@
-// netlify/functions/send-admin-push.js
+// netlify/functions/send-admin-push.js  (CommonJS)
 const admin = require('firebase-admin');
 
 function readServiceAccount() {
@@ -29,72 +29,48 @@ const ALLOWED_ORIGINS = [
   process.env.APP_BASE_URL
 ].filter(Boolean);
 
-function pickOrigin(e) {
+function pickOrigin(e){
   const h = e.headers || {};
   const o = h.origin || h.Origin || (h.host ? `https://${h.host}` : '');
   const best = (process.env.APP_BASE_URL || ALLOWED_ORIGINS[0] || '').replace(/\/$/, '');
   return ALLOWED_ORIGINS.includes(o) ? o : best;
 }
-
-function corsHeaders(origin) {
-  return {
-    'Access-Control-Allow-Origin': origin || '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-  };
-}
+const cors = (origin)=>({
+  'Access-Control-Allow-Origin': origin || '*',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+});
 
 exports.handler = async (event) => {
   const ORIGIN = pickOrigin(event);
-  const CORS = corsHeaders(ORIGIN);
+  const CORS = cors(ORIGIN);
 
-  if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: CORS, body: '' };
-  }
-  if (event.httpMethod !== 'POST') {
-    return { statusCode: 405, headers: CORS, body: 'Method Not Allowed' };
-  }
+  if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: CORS, body: '' };
+  if (event.httpMethod !== 'POST')   return { statusCode: 405, headers: CORS, body: 'Method Not Allowed' };
 
   try {
-    // ---- Verify admin auth (ID token from client) ----
+    // 1) verify Firebase ID token
     const authHeader = event.headers.authorization || event.headers.Authorization || '';
-    if (!authHeader.startsWith('Bearer ')) {
-      return { statusCode: 401, headers: CORS, body: 'Missing auth token' };
-    }
+    if (!authHeader.startsWith('Bearer ')) return { statusCode: 401, headers: CORS, body: 'Missing auth token' };
     const decoded = await admin.auth().verifyIdToken(authHeader.slice(7));
 
-    // Allow only admins: users/{uid}.isAdmin===true OR role==='admin' OR email domain allowlist
+    // 2) allow only admins
     let isAdmin = false;
-    const uDoc = await db.collection('users').doc(decoded.uid).get();
-    if (uDoc.exists && (uDoc.get('isAdmin') === true || uDoc.get('role') === 'admin')) isAdmin = true;
+    const prof = await db.collection('users').doc(decoded.uid).get();
+    if (prof.exists && (prof.get('isAdmin') === true || prof.get('role') === 'admin')) isAdmin = true;
     const email = (decoded.email || '').toLowerCase();
     if (email.endsWith('@bechobazaar.com')) isAdmin = true;
+    if (!isAdmin) return { statusCode: 403, headers: CORS, body: 'Only admins can send push' };
 
-    if (!isAdmin) {
-      return { statusCode: 403, headers: CORS, body: 'Only admins can send push' };
-    }
+    // 3) parse body
+    let body; try { body = JSON.parse(event.body || '{}'); } catch { return { statusCode: 400, headers: CORS, body: 'Invalid JSON body' }; }
+    const { title, message, imageUrl, link, uids } = body;
+    if (!title) return { statusCode: 400, headers: CORS, body: 'title required' };
 
-    // ---- Parse body ----
-    let body;
-    try { body = JSON.parse(event.body || '{}'); }
-    catch { return { statusCode: 400, headers: CORS, body: 'Invalid JSON body' }; }
+    const site = (process.env.APP_BASE_URL || 'https://bechobazaar.com').replace(/\/$/, '');
+    const clickLink = (link && String(link)) || `${site}/`;
 
-    const {
-      title,          // required
-      message,        // optional
-      imageUrl,       // optional
-      link,           // optional (default site home)
-      uids            // optional array of target UIDs (else broadcast all)
-    } = body;
-
-    if (!title || typeof title !== 'string') {
-      return { statusCode: 400, headers: CORS, body: 'title required' };
-    }
-
-    const siteOrigin = (process.env.APP_BASE_URL || 'https://bechobazaar.com').replace(/\/$/, '');
-    const clickLink = (link && String(link)) || `${siteOrigin}/`;
-
-    // ---- Collect tokens ----
+    // 4) collect tokens (targeted UIDs or broadcast all)
     let tokenRefs = [];
     if (Array.isArray(uids) && uids.length) {
       for (const uid of uids) {
@@ -102,21 +78,16 @@ exports.handler = async (event) => {
         qs.forEach(d => tokenRefs.push({ token: d.id, ref: d.ref }));
       }
     } else {
-      // Broadcast to all tokens
       const cg = await db.collectionGroup('fcmTokens').get();
       tokenRefs = cg.docs.map(d => ({ token: d.id, ref: d.ref }));
     }
-    if (!tokenRefs.length) {
-      return { statusCode: 200, headers: CORS, body: JSON.stringify({ sent: 0, failed: 0, tokens: 0 }) };
-    }
+    if (!tokenRefs.length) return { statusCode: 200, headers: CORS, body: JSON.stringify({ sent:0, failed:0, tokens:0 }) };
 
-    const notifTitle = String(title);
-    const notifBody  = typeof message === 'string' ? message : '';
-
+    // 5) build message
     const base = {
       notification: {
-        title: notifTitle,
-        body : notifBody,
+        title: String(title),
+        body : typeof message === 'string' ? message : '',
         ...(imageUrl ? { image: imageUrl } : {})
       },
       data: {
@@ -129,8 +100,8 @@ exports.handler = async (event) => {
         fcmOptions: { link: clickLink },
         headers: { Urgency: 'high' },
         notification: {
-          title: notifTitle,
-          body : notifBody,
+          title: String(title),
+          body : typeof message === 'string' ? message : '',
           icon : '/icons/icon-192.png',
           badge: '/icons/badge-72.png',
           ...(imageUrl ? { image: imageUrl } : {})
@@ -138,7 +109,7 @@ exports.handler = async (event) => {
       }
     };
 
-    // ---- Send in chunks of 500 ----
+    // 6) send in batches
     let success = 0, failed = 0;
     for (let i = 0; i < tokenRefs.length; i += 500) {
       const slice = tokenRefs.slice(i, i + 500);

@@ -28,6 +28,20 @@
   status = 200
   force = true
 
+# ✅ Serve manifest as-is (avoid SPA rewrite)
+[[redirects]]
+  from = "/manifest.webmanifest"
+  to   = "/manifest.webmanifest"
+  status = 200
+  force = true
+
+# ✅ Correct MIME for manifest
+[[headers]]
+  for = "/manifest.webmanifest"
+  [headers.values]
+    Content-Type = "application/manifest+json; charset=utf-8"
+    Cache-Control = "no-store"
+
 # (optional) keep only if you have this function file
 [functions."auto-bump"]
   schedule = "*/10 * * * *"

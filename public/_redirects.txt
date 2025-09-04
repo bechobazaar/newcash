@@ -1,0 +1,2 @@
+http://www.bechobazaar.com/*   https://bechobazaar.com/:splat 301!
+https://www.bechobazaar.com/*  https://bechobazaar.com/:splat 301!

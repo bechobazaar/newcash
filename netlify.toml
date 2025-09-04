@@ -1,5 +1,5 @@
 [build]
-  publish = "."
+  publish = "public"
   command = ""
 
 [functions]
@@ -45,5 +45,6 @@
 # (optional) keep only if you have this function file
 [functions."auto-bump"]
   schedule = "*/10 * * * *"
+
 
 

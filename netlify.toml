@@ -35,6 +35,18 @@
   status = 200
   force = true
 
+[[redirects]]
+  from = "http://www.bechobazaar.com/*"
+  to = "https://bechobazaar.com/:splat"
+  status = 301
+  force = true
+
+[[redirects]]
+  from = "https://www.bechobazaar.com/*"
+  to = "https://bechobazaar.com/:splat"
+  status = 301
+  force = true
+
 # ✅ Correct MIME for manifest
 [[headers]]
   for = "/manifest.webmanifest"
@@ -45,6 +57,7 @@
 # (optional) keep only if you have this function file
 [functions."auto-bump"]
   schedule = "*/10 * * * *"
+
 
 
 

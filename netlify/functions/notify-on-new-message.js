@@ -99,8 +99,8 @@ exports.handler = async (event) => {
         notification: {
           title: FIXED_TITLE,
           body: '',            // no snippet
-          icon: '/icons/icon-192.png',
-          badge: '/icons/badge-72.png'
+          icon: '/icons/icon-192.png?v=6',
+          badge: '/icons/badge-72.png?v=6'
         },
         headers: { Urgency: 'high' }
       }

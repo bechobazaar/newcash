@@ -131,4 +131,4 @@ exports.handler = async (event) => {
     console.error('notify error', err);
     return { statusCode: 500, headers: cors, body: 'Internal Server Error' };
   }
-}; isme kya click function hai 
+};

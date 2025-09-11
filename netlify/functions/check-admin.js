@@ -1,33 +1,69 @@
-// Netlify function absolute URL (क्योंकि frontend ThePowerHost पर है)
-const FN_BASE = 'https://bechobazaar.netlify.app/.netlify/functions';
+// netlify/functions/check-admin.js
+// ❌ DO NOT use: firebase / firebase/app (client SDK)
+// ✅ Use only: firebase-admin (server SDK)
+const admin = require("firebase-admin");
 
-firebase.auth().onAuthStateChanged(async (user)=>{
-  try{
-    if(!user){ blockUI(); return; }
+let initialized = false;
+function init() {
+  if (initialized) return;
 
-    // 1) ताज़ा token लो और debug log करो
-    const token = await user.getIdToken(true);
-    console.log('idToken len=', token?.length, 'prefix=', token?.slice?.(0,12));
+  // Get full service-account JSON from base64 env
+  const jsonString = Buffer.from(
+    process.env.FIREBASE_SERVICE_ACCOUNT_B64,
+    "base64"
+  ).toString("utf8");
+  const serviceAccount = JSON.parse(jsonString);
 
-    // 2) server verify (Authorization header के साथ)
-    const res = await fetch(`${FN_BASE}/check-admin`, {
-      method: 'GET',
-      headers: { Authorization: 'Bearer ' + token }
-    });
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
 
-    if (res.ok) {
-      allowUI();
-    } else {
-      const txt = await res.text();           // 👈 debug मदद करेगा
-      console.warn('check-admin failed:', res.status, txt);
-      await firebase.auth().signOut();
-      blockUI(); clearMsg();
-      showMsg("This Email ID is not registered as Admin.", false);
+  initialized = true;
+}
+
+// CORS: allow your ThePowerHost domain
+const ALLOWED_ORIGIN = "https://bechobazaar.com";
+function corsHeaders(origin) {
+  const o = (origin || "").toLowerCase();
+  const ok = o === ALLOWED_ORIGIN.toLowerCase() ? o : ALLOWED_ORIGIN;
+  return {
+    "Access-Control-Allow-Origin": ok,
+    "Access-Control-Allow-Methods": "POST,GET,OPTIONS",
+    "Access-Control-Allow-Headers": "Authorization,Content-Type",
+    "Access-Control-Max-Age": "86400"
+  };
+}
+
+exports.handler = async (event) => {
+  try {
+    init();
+
+    // Preflight
+    if (event.httpMethod === "OPTIONS") {
+      return { statusCode: 204, headers: corsHeaders(event.headers.origin), body: "" };
     }
-  }catch(err){
-    console.error('verify error', err);
-    await firebase.auth().signOut();
-    blockUI(); clearMsg();
-    showMsg("Verification error. Try again.", false);
+
+    const headers = corsHeaders(event.headers.origin);
+
+    const auth = event.headers.authorization || "";
+    const idToken = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+    if (!idToken) return { statusCode: 401, headers, body: "Missing token" };
+
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const email = (decoded.email || "").toLowerCase();
+
+    const allowed = (process.env.ADMIN_EMAILS || "")
+      .split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
+
+    const ok = allowed.includes(email) || decoded.admin === true;
+    if (!ok) return { statusCode: 403, headers, body: "Forbidden" };
+
+    return {
+      statusCode: 200,
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ ok: true, email })
+    };
+  } catch (e) {
+    return { statusCode: 500, headers: corsHeaders(event.headers?.origin), body: "Error: " + e.message };
   }
-});
+};

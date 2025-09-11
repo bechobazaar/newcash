@@ -20,22 +20,20 @@ exports.handler = async (event) => {
   try {
     init();
 
-    // Require Firebase ID token from client
+    // token from client
     const auth = event.headers.authorization || "";
     const idToken = auth.startsWith("Bearer ") ? auth.slice(7) : null;
     if (!idToken) return { statusCode: 401, body: "Missing token" };
 
-    // Verify token server-side
     const decoded = await admin.auth().verifyIdToken(idToken);
     const email = (decoded.email || "").toLowerCase();
 
-    // Allowlist from env (no exposure to client)
     const allowed = (process.env.ADMIN_EMAILS || "")
       .split(",")
       .map((e) => e.trim().toLowerCase())
       .filter(Boolean);
 
-    const isAllowed = allowed.includes(email) || decoded.admin === true; // (optional) accept custom claim too
+    const isAllowed = allowed.includes(email) || decoded.admin === true;
     if (!isAllowed) return { statusCode: 403, body: "Forbidden" };
 
     return {

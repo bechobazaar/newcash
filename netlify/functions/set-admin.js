@@ -4,18 +4,16 @@ const admin = require('firebase-admin');
 let initialized = false;
 function init() {
   if (initialized) return;
-  // 🔓 decode base64 private key
-  const privateKeyDecoded = Buffer.from(
-    process.env.FIREBASE_PRIVATE_KEY_B64,
+
+  // 🔓 decode full JSON
+  const jsonString = Buffer.from(
+    process.env.FIREBASE_SERVICE_ACCOUNT_B64,
     'base64'
-  ).toString('utf8'); // अब असली multi-line key मिल गई
+  ).toString('utf8');
+  const serviceAccount = JSON.parse(jsonString);
 
   admin.initializeApp({
-    credential: admin.credential.cert({
-      project_id: process.env.FIREBASE_PROJECT_ID,
-      client_email: process.env.FIREBASE_CLIENT_EMAIL,
-      private_key: privateKeyDecoded,   // NOTE: replace() की जरूरत नहीं
-    }),
+    credential: admin.credential.cert(serviceAccount),
   });
   initialized = true;
 }
@@ -23,7 +21,6 @@ function init() {
 exports.handler = async (event) => {
   try {
     init();
-    // simple protection
     if (event.headers['x-admin-secret'] !== process.env.SET_ADMIN_SECRET) {
       return { statusCode: 403, body: 'Forbidden' };
     }

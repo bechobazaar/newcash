@@ -1,15 +1,13 @@
-// netlify/functions/set-admin.js
-const admin = require('firebase-admin');
+// netlify/functions/check-admin.js
+const admin = require("firebase-admin");
 
 let initialized = false;
 function init() {
   if (initialized) return;
-
-  // 🔓 decode full JSON
   const jsonString = Buffer.from(
     process.env.FIREBASE_SERVICE_ACCOUNT_B64,
-    'base64'
-  ).toString('utf8');
+    "base64"
+  ).toString("utf8");
   const serviceAccount = JSON.parse(jsonString);
 
   admin.initializeApp({
@@ -21,17 +19,31 @@ function init() {
 exports.handler = async (event) => {
   try {
     init();
-    if (event.headers['x-admin-secret'] !== process.env.SET_ADMIN_SECRET) {
-      return { statusCode: 403, body: 'Forbidden' };
-    }
 
-    const { email } = JSON.parse(event.body || '{}');
-    if (!email) return { statusCode: 400, body: 'Email required' };
+    // Require Firebase ID token from client
+    const auth = event.headers.authorization || "";
+    const idToken = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+    if (!idToken) return { statusCode: 401, body: "Missing token" };
 
-    const user = await admin.auth().getUserByEmail(email);
-    await admin.auth().setCustomUserClaims(user.uid, { admin: true });
-    return { statusCode: 200, body: `OK: ${email} is now admin` };
+    // Verify token server-side
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const email = (decoded.email || "").toLowerCase();
+
+    // Allowlist from env (no exposure to client)
+    const allowed = (process.env.ADMIN_EMAILS || "")
+      .split(",")
+      .map((e) => e.trim().toLowerCase())
+      .filter(Boolean);
+
+    const isAllowed = allowed.includes(email) || decoded.admin === true; // (optional) accept custom claim too
+    if (!isAllowed) return { statusCode: 403, body: "Forbidden" };
+
+    return {
+      statusCode: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ok: true, email }),
+    };
   } catch (e) {
-    return { statusCode: 500, body: 'Error: ' + e.message };
+    return { statusCode: 500, body: "Error: " + e.message };
   }
 };

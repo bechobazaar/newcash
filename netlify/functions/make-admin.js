@@ -1,4 +1,3 @@
-// netlify/functions/make-admin.js
 const admin = require("firebase-admin");
 
 let inited = false;
@@ -15,10 +14,7 @@ function getAdmin(){
 exports.handler = async () => {
   try {
     const adminSDK = getAdmin();
-
-    // 🔴 yahan apne admin user ka exact UID daalo (Firebase Console → Authentication → Users me milta hai)
     const uid = "DIz6jbc2xrSZWpkqF5yF2maLcoy2";
-
     await adminSDK.auth().setCustomUserClaims(uid, { admin: true });
     return { statusCode: 200, body: JSON.stringify({ ok: true, uid }) };
   } catch (e) {

@@ -36,6 +36,24 @@ const pickOrigin = (e) => {
     : (process.env.APP_BASE_URL || ALLOWED_ORIGINS[0] || '').replace(/\/$/, '');
 };
 
+// ---- NEW: human friendly snippet ----
+function buildSnippet(m = {}) {
+  // Common types you use: text, offer, image, file, phone_shared, location, etc.
+  const type = (m.type || '').toLowerCase();
+  const raw  = String(m.text || m.caption || '').replace(/\s+/g, ' ').trim();
+  const trunc = (s, n = 90) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+
+  if (type === 'offer')  return '💬 New offer';
+  if (type === 'image')  return raw ? `📷 ${trunc(raw)}` : '📷 Photo';
+  if (type === 'file')   return raw ? `📎 ${trunc(raw)}` : '📎 File';
+  if (type === 'phone_shared') return '☎️ Phone number shared';
+  if (type === 'location')     return '📍 Location shared';
+
+  // default → text
+  if (raw) return trunc(raw);
+  return 'New message';
+}
+
 exports.handler = async (event) => {
   const ORIGIN = pickOrigin(event);
   const cors = {
@@ -82,27 +100,40 @@ exports.handler = async (event) => {
       return { statusCode: 200, headers: cors, body: JSON.stringify({ sent: 0, failed: 0, recipients, tokens: 0 }) };
     }
 
-    // Always open chat list
+    // Build deep link (chat-list for safety; optionally point to /chat?chatId=...)
     const siteOrigin = (ORIGIN || process.env.APP_BASE_URL || 'https://bechobazaar.com').replace(/\/$/, '');
     const link = `${siteOrigin}/chat-list.html`;
 
     const FIXED_TITLE = 'New message received';
+    const snippet = buildSnippet(m);
 
+    // ---- IMPORTANT: fill notification + webpush.notification + data ----
     const base = {
-      // Android/iOS/Safari fallback
-      notification: { title: FIXED_TITLE, body: '' }, // no snippet
-      // Data for SW
-      data: { chatId, senderId: String(m.senderId || ''), messageId, link },
+      notification: { title: FIXED_TITLE, body: snippet },
+      data: {
+        title: FIXED_TITLE,
+        body: snippet,
+        url: link,
+        chatId,
+        senderId: String(m.senderId || ''),
+        messageId: String(messageId || ''),
+      },
       android: { priority: 'high' },
+      apns: { headers: { 'apns-priority': '10' } },
       webpush: {
-        fcmOptions: { link }, // Chrome default click target
+        fcmOptions: { link }, // Chrome default click
+        headers: {
+          Urgency: 'high',
+          TTL: '300' // 5 minutes
+        },
         notification: {
           title: FIXED_TITLE,
-          body: '',            // no snippet
+          body: snippet,
           icon: '/icons/icon-192.png',
-          badge: '/icons/badge-72.png'
-        },
-        headers: { Urgency: 'high' }
+          badge: '/icons/badge-72.png',
+          tag: chatId ? `chat_${chatId}` : 'chat_inbox',
+          renotify: true
+        }
       }
     };
 

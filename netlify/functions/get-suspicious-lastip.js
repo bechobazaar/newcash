@@ -93,6 +93,7 @@ exports.handler = async (event)=>{
           displayName: normStr(d.displayName),
           lastLogin: toISO(d.lastLogin),
           lastActive: toISO(d.lastActive),
+          suspended: !!d.suspended
         };
         byIp.get(k).users.push(u);
       }catch{

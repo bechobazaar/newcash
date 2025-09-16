@@ -5,6 +5,7 @@
 [functions]
   directory = "netlify/functions"
   node_bundler = "esbuild"
+  external_node_modules = ["web-push", "firebase-admin"]
 
 [build.environment]
   NODE_VERSION = "18"
@@ -58,3 +59,4 @@
 # (optional) keep only if you actually have this function file
 [functions."auto-bump"]
   schedule = "*/10 * * * *"
+

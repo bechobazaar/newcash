@@ -1,4 +1,3 @@
-// /.netlify/functions/notify-user.js
 const admin = require('firebase-admin');
 
 function initAdmin() {
@@ -9,16 +8,13 @@ function initAdmin() {
     admin.initializeApp({ credential: admin.credential.cert(obj) });
   }
 }
-function parseOrigins(csv){
-  return String(csv || '').split(',').map(s=>s.trim()).filter(Boolean);
-}
+function parseOrigins(csv){ return String(csv || '').split(',').map(s=>s.trim()).filter(Boolean); }
 function pickOrigin(event){
-  const allowed = parseOrigins(process.env.ALLOWED_ORIGINS) || [];
+  const allowed = parseOrigins(process.env.ALLOWED_ORIGINS);
   const hdr = event.headers || {};
   const o = hdr.origin || hdr.Origin || (hdr.host ? `https://${hdr.host}` : '');
   const base = (process.env.APP_BASE_URL || '').replace(/\/$/, '');
-  if (allowed.includes(o)) return o;
-  return base || allowed[0] || '*';
+  return allowed.includes(o) ? o : (base || allowed[0] || '*');
 }
 
 exports.handler = async (event) => {
@@ -35,7 +31,7 @@ exports.handler = async (event) => {
   if (event.httpMethod !== 'POST')   return { statusCode: 405, headers: cors, body: 'Method Not Allowed' };
 
   try {
-    // Auth: either Admin secret or Firebase ID token
+    // Auth (admin secret OR user token)
     const adminKey = process.env.ADMIN_PUSH_KEY || process.env.ADMIN_PUSH_SECRET;
     const s = event.headers['x-admin-secret'];
     if (!(adminKey && s && s === adminKey)) {
@@ -51,42 +47,42 @@ exports.handler = async (event) => {
     const base = (process.env.APP_BASE_URL || 'https://bechobazaar.com').replace(/\/$/, '');
     if (!/^https?:\/\//.test(url)) url = `${base}${url.startsWith('/') ? '' : '/'}${url}`;
 
-    // Collect endpoints (legacy + unified) → FCM tokens
+    // tokens (legacy + unified) → dedupe
     const tokens = new Set();
     const legacy = await db.collection('users').doc(uid).collection('fcmTokens').get();
     legacy.forEach(d => d.id && tokens.add(d.id));
-
     const pe = await db.collection('users').doc(uid).collection('pushEndpoints').get();
     pe.forEach(d => { const x=d.data()||{}; if ((x.type==='fcm_web'||x.type==='native') && x.token) tokens.add(x.token); });
 
-    const tokenList = Array.from(tokens).filter(Boolean);
+    const arr = Array.from(tokens);
     let success = 0, failed = 0;
 
-    if (tokenList.length){
-      // ✅ DATA-ONLY FCM: NO 'notification' field → Chrome won't auto show
+    if (arr.length){
+      // DATA-ONLY (no 'notification' field) — SW renders, avoids duplicates
       const msg = {
-        tokens: tokenList,
+        tokens: arr,
         data: {
           title: String(title),
           body:  String(msgBody || ''),
           url, tag: String(tag),
           ch: 'fcm',
-          ...Object.fromEntries(Object.entries(data || {}).map(([k,v]) => [k, String(v)]))
+          kind: 'system',
+          ...Object.fromEntries(Object.entries(data || {}).map(([k,v])=>[k,String(v)]))
         },
         webpush: { fcmOptions: { link: url }, headers: { Urgency:'high', TTL:'600' } },
-        android: { priority: 'high' },
-        apns: { headers: { 'apns-priority': '10' } }
+        android: { priority:'high' },
+        apns: { headers: { 'apns-priority':'10' } }
       };
       const res = await admin.messaging().sendEachForMulticast(msg);
       success += res.successCount; failed += res.failureCount;
 
-      // Clean invalid tokens from both stores
+      // cleanup invalid tokens from BOTH stores
       for (let i=0;i<res.responses.length;i++){
         const r = res.responses[i];
         if (!r.success) {
           const code = r.error?.code || '';
           if (code.includes('registration-token-not-registered') || code.includes('invalid-argument')) {
-            const bad = tokenList[i];
+            const bad = arr[i];
             try {
               await db.collection('users').doc(uid).collection('fcmTokens').doc(bad).delete().catch(()=>{});
               const qs = await db.collection('users').doc(uid).collection('pushEndpoints').where('token','==',bad).get();

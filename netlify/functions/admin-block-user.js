@@ -1,75 +1,64 @@
-// netlify/functions/admin-block-user.js
 const admin = require("firebase-admin");
-
-/* ==== CORS helpers ==== */
 const ORIGIN = "https://bechobazaar.com";
 const CORS = {
   "Access-Control-Allow-Origin": ORIGIN,
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Authorization, Content-Type",
 };
-const ok  = (b,h) => ({ statusCode:200, headers:{...CORS, ...(h||{})}, body:JSON.stringify(b) });
-const err = (s,b) => ({ statusCode:s, headers:CORS, body:JSON.stringify(b) });
-const noc = ()    => ({ statusCode:204, headers:CORS, body:"" });
+const ok=(b,h)=>({statusCode:200,headers:{...CORS,...(h||{})},body:JSON.stringify(b)});
+const err=(s,b)=>({statusCode:s,headers:CORS,body:JSON.stringify(b)});
+const noc=()=>({statusCode:204,headers:CORS,body:""});
 
-/* ==== Admin init ==== */
-let _inited = false;
+let inited=false;
 function getAdmin(){
-  if (_inited) return admin;
-  const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_B64;
-  if (!b64) throw new Error("FIREBASE_SERVICE_ACCOUNT_B64 missing");
-  const svc = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
-  if (svc.private_key) svc.private_key = svc.private_key.replace(/\\n/g, "\n");
+  if (inited) return admin;
+  const b64=process.env.FIREBASE_SERVICE_ACCOUNT_B64;
+  const svc=JSON.parse(Buffer.from(b64,'base64').toString('utf8'));
+  if (svc.private_key) svc.private_key = svc.private_key.replace(/\\n/g,"\n");
   admin.initializeApp({ credential: admin.credential.cert(svc) });
-  _inited = true;
-  return admin;
+  inited=true; return admin;
 }
-
 async function requireAdmin(token){
-  const adminSDK = getAdmin();
-  const dec = await adminSDK.auth().verifyIdToken(token);
+  const dec = await getAdmin().auth().verifyIdToken(token);
   if (!dec || dec.admin !== true){ const e=new Error("NOT_ADMIN"); e.code="NOT_ADMIN"; throw e; }
   return dec;
 }
 
-exports.handler = async (event) => {
+exports.handler = async (event)=>{
   if (event.httpMethod === "OPTIONS") return noc();
-  if (event.httpMethod !== "POST")    return err(405, { error:"Method Not Allowed" });
-
+  if (event.httpMethod !== "POST")    return err(405,{error:"Method Not Allowed"});
   try{
-    const auth  = event.headers.authorization || event.headers.Authorization || "";
-    const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-    if (!token) return err(401, { error:"Missing token" });
+    const auth = event.headers.authorization || event.headers.Authorization || "";
+    const token = auth.startsWith("Bearer ")? auth.slice(7): null;
+    if (!token) return err(401,{error:"Missing token"});
     await requireAdmin(token);
 
-    const body   = JSON.parse(event.body || "{}");
-    const uid    = body.uid;
-    const action = String(body.action || "disable").toLowerCase();
-    if (!uid) return err(400, { error:"uid required" });
+    const body = JSON.parse(event.body||"{}");
+    const uid = body.uid;
+    const action = String(body.action||"disable").toLowerCase();
+    if (!uid) return err(400,{error:"uid required"});
 
     const adminSDK = getAdmin();
     const db = adminSDK.firestore();
 
-    if (action === "disable") {
-      await adminSDK.auth().updateUser(uid, { disabled: true });
+    if (action==="disable"){
+      await adminSDK.auth().updateUser(uid, { disabled:true });
       await db.collection("users").doc(uid).set(
-        { suspended: true, suspendedAt: adminSDK.firestore.Timestamp.now(), suspendedBy: "admin" },
-        { merge: true }
+        { suspended:true, suspendedAt: adminSDK.firestore.Timestamp.now(), suspendedBy:"admin" },
+        { merge:true }
       );
-    } else if (action === "enable") {
-      await adminSDK.auth().updateUser(uid, { disabled: false });
+    } else if (action==="enable"){
+      await adminSDK.auth().updateUser(uid, { disabled:false });
       await db.collection("users").doc(uid).set(
-        { suspended: false, suspendedAt: null, suspendedBy: null },
-        { merge: true }
+        { suspended:false, suspendedAt:null, suspendedBy:null },
+        { merge:true }
       );
-    } else {
-      return err(400, { error:"unknown action" });
-    }
+    } else return err(400,{error:"unknown action"});
 
     return ok({ ok:true });
   }catch(e){
-    if (e.code === "NOT_ADMIN") return err(403, { error:"Forbidden" });
-    console.error("admin-block-user error:", e);
-    return err(500, { ok:false, error: e.message });
+    if (e.code==="NOT_ADMIN") return err(403,{error:"Forbidden"});
+    console.error("admin-block-user", e);
+    return err(500,{ok:false,error:e.message});
   }
 };

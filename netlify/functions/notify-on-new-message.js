@@ -1,4 +1,6 @@
+// netlify/functions/notify-on-new-message.js
 const admin = require('firebase-admin');
+const { sendAppilixPush } = require('./_lib/appilix');   // ← helper ka sahi path
 
 function initAdmin() {
   if (!admin.apps.length) {
@@ -9,6 +11,7 @@ function initAdmin() {
     admin.initializeApp({ credential: admin.credential.cert(obj) });
   }
 }
+
 function parseOrigins(csv){ return String(csv || '').split(',').map(s=>s.trim()).filter(Boolean); }
 function pickOrigin(event){
   const allowed = parseOrigins(process.env.ALLOWED_ORIGINS);
@@ -32,6 +35,7 @@ exports.handler = async (event) => {
     'Vary': 'Origin',
     'Cache-Control': 'no-store'
   };
+
   if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: cors, body: '' };
   if (event.httpMethod !== 'POST')   return { statusCode: 405, headers: cors, body: 'Method Not Allowed' };
 
@@ -46,6 +50,7 @@ exports.handler = async (event) => {
     const { chatId, messageId, linkOverride } = JSON.parse(event.body || '{}');
     if (!chatId || !messageId) return { statusCode: 400, headers: cors, body: 'chatId and messageId required' };
 
+    // chat & message
     const chatRef = db.collection('chats').doc(chatId);
     const chatDoc = await chatRef.get();
     if (!chatDoc.exists) return { statusCode: 404, headers: cors, body: 'Chat not found' };
@@ -58,9 +63,9 @@ exports.handler = async (event) => {
     const recipients = users.filter(u => u !== m.senderId);
     if (!recipients.length) return { statusCode: 200, headers: cors, body: JSON.stringify({ sent:0, failed:0, reason:'No recipients' }) };
 
+    // collect tokens
     const tokenSet = new Set();
     const tokenOwners = new Map();
-
     await Promise.all(recipients.map(async (uid) => {
       const base = db.collection('users').doc(uid);
       const [t1, t2] = await Promise.all([
@@ -70,68 +75,81 @@ exports.handler = async (event) => {
       t1.forEach(d => { const tok=d.id; if(tok){ tokenSet.add(tok); (tokenOwners.get(tok)||tokenOwners.set(tok,new Set()).get(tok)).add(uid); }});
       t2.forEach(d => { const x=d.data()||{}; const tok=x.token; if(tok){ tokenSet.add(tok); (tokenOwners.get(tok)||tokenOwners.set(tok,new Set()).get(tok)).add(uid); }});
     }));
-
     const tokens = Array.from(tokenSet);
-    if (!tokens.length) return { statusCode: 200, headers: cors, body: JSON.stringify({ sent:0, failed:0, reason:'No device tokens' }) };
 
     const site = (process.env.APP_BASE_URL || 'https://bechobazaar.com').replace(/\/$/,'');
     const link = linkOverride || `${site}/chat-list.html`;
     const tag  = chatId ? `chat_${chatId}` : 'chat_inbox';
     const { title, body } = buildSafeTitleBodyForChat();
 
-    const baseMsg = {
-      data: {
-        title, body, url: link, tag,
-        ch: 'fcm',
-        kind: 'chat',
-        chatId: String(chatId),
-        senderId: String(m.senderId || ''),
-        messageId: String(messageId)
-      },
-      webpush: { fcmOptions: { link }, headers: { Urgency: 'high', TTL: '600' } },
-      android: { priority: 'high', collapseKey: tag },
-      apns: { headers: { 'apns-priority': '10' } }
-    };
-
-    const batches = chunk(tokens, 500);
+    // ====== FCM (browsers/PWA) ======
     let sent=0, failed=0, cleaned=0;
+    if (tokens.length){
+      const baseMsg = {
+        data: {
+          title, body, url: link, tag,
+          ch: 'fcm',
+          kind: 'chat',
+          chatId: String(chatId),
+          senderId: String(m.senderId || ''),
+          messageId: String(messageId)
+        },
+        webpush: { fcmOptions: { link }, headers: { Urgency: 'high', TTL: '600' } },
+        android: { priority: 'high', collapseKey: tag },
+        apns: { headers: { 'apns-priority': '10' } }
+      };
+      const batches = chunk(tokens, 500);
+      for (const batch of batches) {
+        const res = dryRun
+          ? { successCount: batch.length, failureCount: 0, responses: batch.map(()=>({success:true})) }
+          : await admin.messaging().sendEachForMulticast({ ...baseMsg, tokens: batch });
 
-    for (const batch of batches) {
-      const msg = { ...baseMsg, tokens: batch };
-      const res = dryRun
-        ? { successCount: batch.length, failureCount: 0, responses: batch.map(()=>({success:true})) }
-        : await admin.messaging().sendEachForMulticast(msg);
+        sent   += res.successCount || 0;
+        failed += res.failureCount || 0;
 
-      sent += res.successCount || 0;
-      failed += res.failureCount || 0;
-
-      if (!dryRun) {
-        for (let i=0;i<res.responses.length;i++){
-          const r = res.responses[i];
-          if (r && !r.success) {
-            const code = r.error?.code || '';
-            const isBad = code.includes('registration-token-not-registered') ||
-                          code.includes('invalid-argument') ||
-                          code.includes('messaging/registration-token-not-registered');
-            if (isBad) {
-              const bad = batch[i];
-              const owners = Array.from((tokenOwners.get(bad) || new Set()));
-              await Promise.all(owners.map(async (uid) => {
-                try {
-                  await db.collection('users').doc(uid).collection('fcmTokens').doc(bad).delete().catch(()=>{});
-                  const qs = await db.collection('users').doc(uid).collection('pushEndpoints').where('token','==',bad).get();
-                  const dels=[]; qs.forEach(d => dels.push(d.ref.delete().catch(()=>{})));
-                  await Promise.all(dels);
-                } catch {}
-              }));
-              cleaned += 1;
+        if (!dryRun) {
+          for (let i=0;i<res.responses.length;i++){
+            const r = res.responses[i];
+            if (r && !r.success) {
+              const code = r.error?.code || '';
+              const isBad = code.includes('registration-token-not-registered') ||
+                            code.includes('invalid-argument') ||
+                            code.includes('messaging/registration-token-not-registered');
+              if (isBad) {
+                const bad = batch[i];
+                const owners = Array.from((tokenOwners.get(bad) || new Set()));
+                await Promise.all(owners.map(async (uid) => {
+                  try {
+                    await db.collection('users').doc(uid).collection('fcmTokens').doc(bad).delete().catch(()=>{});
+                    const qs = await db.collection('users').doc(uid).collection('pushEndpoints').where('token','==',bad).get();
+                    const dels=[]; qs.forEach(d => dels.push(d.ref.delete().catch(()=>{})));
+                    await Promise.all(dels);
+                  } catch {}
+                }));
+                cleaned += 1;
+              }
             }
           }
         }
       }
     }
 
-    return { statusCode: 200, headers: cors, body: JSON.stringify({ sent, failed, cleaned, tokens: tokens.length, recipients: recipients.length, batches: batches.length, dryRun }) };
+    // ====== Appilix (APK/WebView) ======
+    const APPILIX_APP_KEY = process.env.APPILIX_APP_KEY;
+    const APPILIX_API_KEY = process.env.APPILIX_API_KEY;
+    let appilix = [];
+    if (APPILIX_APP_KEY && APPILIX_API_KEY) {
+      const pushes = recipients.map(uid => sendAppilixPush({
+        appKey: APPILIX_APP_KEY,
+        apiKey: APPILIX_API_KEY,
+        title, body,
+        user_identity: uid,
+        open_link_url: link
+      }).catch(e => ({ error: e.message, uid })));
+      appilix = await Promise.all(pushes);
+    }
+
+    return { statusCode: 200, headers: cors, body: JSON.stringify({ fcm: { sent, failed, cleaned, tokens: tokens.length }, appilix }) };
   } catch (e) {
     console.error('notify-on-new-message error', e);
     return { statusCode: 500, headers: cors, body: 'Internal Server Error' };

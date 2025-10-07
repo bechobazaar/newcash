@@ -2,9 +2,29 @@
 const { initAdminFromB64 } = require('./firebaseAdmin');
 const admin = initAdminFromB64();
 const db = admin.firestore();
-const { sendAppilixPush } = require('./sendAppilixPush');
 
-const ALLOW_ORIGIN = 'https://bechobazaar.com'; // add https://www.bechobazaar.com if needed
+// Appilix API helper (user_identity targeting)
+async function sendAppilixPush({ appKey, apiKey, title, body, user_identity, open_link_url }) {
+  const url = 'https://appilix.com/api/push-notification';
+  const form = new URLSearchParams();
+  form.set('app_key', appKey);
+  form.set('api_key', apiKey);
+  form.set('notification_title', title || 'Notification');
+  form.set('notification_body',  body  || '');
+  if (user_identity) form.set('user_identity', user_identity);
+  if (open_link_url) form.set('open_link_url', open_link_url);
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type':'application/x-www-form-urlencoded' },
+    body: form.toString()
+  });
+  const text = await res.text().catch(()=> '');
+  if (!res.ok) throw new Error(`Appilix API failed: ${res.status} ${text}`);
+  return { ok:true, status:res.status };
+}
+
+const ALLOW_ORIGIN = 'https://bechobazaar.com';
 
 function cors() {
   return {
@@ -26,37 +46,20 @@ async function getMessage(chatId, messageId) {
   const snap = await ref.get();
   return snap.exists ? ({ id: snap.id, ...snap.data() }) : null;
 }
-async function getUserTokens(uid) {
+async function fcmTokensOf(uid){
   const tokens = [];
-  const endpoints = [];
-  const tokSnap = await db.collection('users').doc(uid).collection('fcmTokens').get();
-  tokSnap.forEach(d => tokens.push(d.id));
-  const endSnap = await db.collection('users').doc(uid).collection('pushEndpoints').get();
-  endSnap.forEach(d => endpoints.push({ id: d.id, ...d.data() }));
-  return { tokens, endpoints };
+  const snap = await db.collection('users').doc(uid).collection('fcmTokens').get();
+  snap.forEach(d => tokens.push(d.id));
+  return tokens;
 }
-async function sendFCM(tokens, payload) {
-  if (!tokens.length) return { ok: true, count: 0 };
-  const res = await admin.messaging().sendToDevice(tokens, payload, { priority: 'high' });
-  return { ok: true, res };
+async function sendFCM(allTokens, payload) {
+  if (!allTokens.length) return { ok:true, count:0 };
+  const res = await admin.messaging().sendToDevice(allTokens, payload, { priority:'high' });
+  return { ok:true, res };
 }
-function makeNotificationPayload({ title, body, url, tag }) {
-  return { data: { title: title || 'New message', body: body || 'You have a new message', url: url || '/chat-list', tag: tag || 'chat_inbox' } };
-}
-async function sendAppilix(endpoints, title, body, url) {
-  const appKey = process.env.APPILIX_APP_KEY;
-  const apiKey = process.env.APPILIX_API_KEY;
-  if (!appKey || !apiKey) return { ok: true };
-  const nativeTargets = endpoints.filter(e => (e.type || '').startsWith('appilix'));
-  if (!nativeTargets.length) return { ok: true };
-  const absUrl = new URL(url, 'https://bechobazaar.com').href;
-  const results = [];
-  for (const e of nativeTargets) {
-    const user_identity = e.token || e.id;
-    try { results.push(await sendAppilixPush({ appKey, apiKey, title, body, user_identity, open_link_url: absUrl })); }
-    catch (err) { results.push({ ok:false, error:String(err) }); }
-  }
-  return { ok:true, count:results.length, results };
+function makeDataPayload({ title, body, url, tag }) {
+  // data-only so that SW shows even in background reliably
+  return { data: { title, body, url, tag } };
 }
 
 exports.handler = async (event) => {
@@ -64,47 +67,81 @@ exports.handler = async (event) => {
     return { statusCode: 204, headers: cors(), body: '' };
   }
   try {
-    if (event.httpMethod !== 'POST') return { statusCode: 405, headers: cors(), body: 'Method Not Allowed' };
+    if (event.httpMethod !== 'POST')
+      return { statusCode: 405, headers: cors(), body: 'Method Not Allowed' };
 
-    const authH = (event.headers && (event.headers.authorization || event.headers.Authorization)) || '';
+    const authH = (event.headers.authorization || event.headers.Authorization || '');
     const m = authH.match(/^Bearer\s+(.+)$/i);
     if (!m) return { statusCode: 401, headers: cors(), body: 'Missing bearer token' };
 
     let decoded;
-    try { decoded = await admin.auth().verifyIdToken(m[1], false); }
+    try { decoded = await admin.auth().verifyIdToken(m[1]); }
     catch (e) {
-      console.error('[AUTH] verifyIdToken error', { code: e.code, message: e.message });
-      return { statusCode: 401, headers: cors(), body: `Invalid token (${e.code || 'unknown'}): ${e.message || ''}` };
+      return { statusCode: 401, headers: cors(), body: `Invalid token: ${e.message || ''}` };
     }
 
     const { chatId, messageId } = JSON.parse(event.body || '{}');
-    if (!chatId || !messageId) return { statusCode: 400, headers: cors(), body: 'chatId and messageId required' };
+    if (!chatId || !messageId)
+      return { statusCode: 400, headers: cors(), body: 'chatId and messageId required' };
 
     const msg = await getMessage(chatId, messageId);
     if (!msg) return { statusCode: 404, headers: cors(), body: 'message not found' };
 
     const senderUid = msg.senderId || decoded.uid;
-    const recips = await getRecipients(chatId, senderUid);
-    if (!recips.length) return { statusCode: 200, headers: cors(), body: JSON.stringify({ ok: true, sent: 0 }) };
+    const recipients = await getRecipients(chatId, senderUid);
+    if (!recipients.length)
+      return { statusCode: 200, headers: cors(), body: JSON.stringify({ ok:true, sent:0 }) };
 
-    const title = msg.senderName ? `${msg.senderName}` : 'New message';
-    const bodyTxt = msg.text ? msg.text.slice(0, 80) : 'Tap to view';
-    const url   = `/chat/${encodeURIComponent(chatId)}`; // ✅ pretty URL
-    const tag   = `chat_${chatId}`;
-    const payload = makeNotificationPayload({ title, body: bodyTxt, url, tag });
+    // Compose notification content (OLX-like)
+    const senderName = msg.senderName || 'New message';
+    const bodyText   = (msg.text || 'Tap to view').slice(0, 80);
+    const openUrl    = `/chat/${encodeURIComponent(chatId)}`;  // pretty URL
+    const tag        = `chat_${chatId}`;
 
-    let totalTokens = [];
-    let allEndpoints = [];
-    for (const uid of recips) {
-      const { tokens, endpoints } = await getUserTokens(uid);
-      totalTokens = totalTokens.concat(tokens);
-      allEndpoints = allEndpoints.concat(endpoints || []);
+    // FCM collect
+    let fcmAll = [];
+    for (const uid of recipients) {
+      const t = await fcmTokensOf(uid);
+      fcmAll = fcmAll.concat(t);
+    }
+    const fcmPayload = makeDataPayload({ title: `New message from ${senderName}`, body: bodyText, url: openUrl, tag });
+    const fcmRes = await sendFCM(fcmAll, fcmPayload);
+
+    // Appilix per-user via user_identity = uid
+    let appilixStatus = { ok:true, count:0, results:[] };
+    const APP_KEY = process.env.APPILIX_APP_KEY;
+    const API_KEY = process.env.APPILIX_API_KEY;
+    if (APP_KEY && API_KEY) {
+      const absUrl = new URL(openUrl, 'https://bechobazaar.com').href;
+      for (const uid of recipients) {
+        try {
+          const r = await sendAppilixPush({
+            appKey: APP_KEY,
+            apiKey: API_KEY,
+            title: `New message from ${senderName}`,
+            body: bodyText,
+            user_identity: uid,          // 🔑 identity set in app at login
+            open_link_url: absUrl
+          });
+          appilixStatus.results.push({ uid, ok:true });
+        } catch (e) {
+          appilixStatus.results.push({ uid, ok:false, error: String(e) });
+        }
+      }
+      appilixStatus.count = appilixStatus.results.length;
     }
 
-    const fcmRes = await sendFCM(totalTokens, payload);
-    const appRes = await sendAppilix(allEndpoints, title, bodyTxt, url);
-
-    return { statusCode: 200, headers: cors(), body: JSON.stringify({ ok: true, recipients: recips.length, fcmTokens: totalTokens.length, fcmResult: fcmRes, appilix: appRes }) };
+    return {
+      statusCode: 200,
+      headers: cors(),
+      body: JSON.stringify({
+        ok: true,
+        recipients: recipients.length,
+        fcmTokens: fcmAll.length,
+        fcmResult: fcmRes,
+        appilix: appilixStatus
+      })
+    };
   } catch (e) {
     console.error('notify error', e);
     return { statusCode: 500, headers: cors(), body: 'Internal error' };

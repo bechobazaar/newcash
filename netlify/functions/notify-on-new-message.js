@@ -2,9 +2,9 @@
 const { initAdminFromB64 } = require('./firebaseAdmin');
 const admin = initAdminFromB64();
 const db = admin.firestore();
-const { sendAppilixPush } = require('./sendAppilixPush'); // optional; env decides usage
+const { sendAppilixPush } = require('./sendAppilixPush');
 
-const ALLOW_ORIGIN = 'https://bechobazaar.com'; // exact origin
+const ALLOW_ORIGIN = 'https://bechobazaar.com'; // add https://www.bechobazaar.com if needed
 
 function cors() {
   return {
@@ -41,14 +41,7 @@ async function sendFCM(tokens, payload) {
   return { ok: true, res };
 }
 function makeNotificationPayload({ title, body, url, tag }) {
-  return {
-    data: {
-      title: title || 'New message',
-      body:  body  || 'You have a new message',
-      url:   url   || '/chat-list.html',
-      tag:   tag   || 'chat_inbox'
-    }
-  };
+  return { data: { title: title || 'New message', body: body || 'You have a new message', url: url || '/chat-list', tag: tag || 'chat_inbox' } };
 }
 async function sendAppilix(endpoints, title, body, url) {
   const appKey = process.env.APPILIX_APP_KEY;
@@ -60,9 +53,8 @@ async function sendAppilix(endpoints, title, body, url) {
   const results = [];
   for (const e of nativeTargets) {
     const user_identity = e.token || e.id;
-    try {
-      results.push(await sendAppilixPush({ appKey, apiKey, title, body, user_identity, open_link_url: absUrl }));
-    } catch (err) { results.push({ ok:false, error:String(err) }); }
+    try { results.push(await sendAppilixPush({ appKey, apiKey, title, body, user_identity, open_link_url: absUrl })); }
+    catch (err) { results.push({ ok:false, error:String(err) }); }
   }
   return { ok:true, count:results.length, results };
 }
@@ -72,24 +64,20 @@ exports.handler = async (event) => {
     return { statusCode: 204, headers: cors(), body: '' };
   }
   try {
-    if (event.httpMethod !== 'POST') {
-      return { statusCode: 405, headers: cors(), body: 'Method Not Allowed' };
-    }
+    if (event.httpMethod !== 'POST') return { statusCode: 405, headers: cors(), body: 'Method Not Allowed' };
 
     const authH = (event.headers && (event.headers.authorization || event.headers.Authorization)) || '';
     const m = authH.match(/^Bearer\s+(.+)$/i);
     if (!m) return { statusCode: 401, headers: cors(), body: 'Missing bearer token' };
 
     let decoded;
-    try {
-      decoded = await admin.auth().verifyIdToken(m[1], false);
-    } catch (e) {
+    try { decoded = await admin.auth().verifyIdToken(m[1], false); }
+    catch (e) {
       console.error('[AUTH] verifyIdToken error', { code: e.code, message: e.message });
       return { statusCode: 401, headers: cors(), body: `Invalid token (${e.code || 'unknown'}): ${e.message || ''}` };
     }
 
-    const body = JSON.parse(event.body || '{}');
-    const { chatId, messageId } = body;
+    const { chatId, messageId } = JSON.parse(event.body || '{}');
     if (!chatId || !messageId) return { statusCode: 400, headers: cors(), body: 'chatId and messageId required' };
 
     const msg = await getMessage(chatId, messageId);
@@ -101,7 +89,7 @@ exports.handler = async (event) => {
 
     const title = msg.senderName ? `${msg.senderName}` : 'New message';
     const bodyTxt = msg.text ? msg.text.slice(0, 80) : 'Tap to view';
-    const url   = `/chat.html?chatId=${encodeURIComponent(chatId)}`;
+    const url   = `/chat/${encodeURIComponent(chatId)}`; // ✅ pretty URL
     const tag   = `chat_${chatId}`;
     const payload = makeNotificationPayload({ title, body: bodyTxt, url, tag });
 
@@ -116,11 +104,7 @@ exports.handler = async (event) => {
     const fcmRes = await sendFCM(totalTokens, payload);
     const appRes = await sendAppilix(allEndpoints, title, bodyTxt, url);
 
-    return {
-      statusCode: 200,
-      headers: cors(),
-      body: JSON.stringify({ ok: true, recipients: recips.length, fcmTokens: totalTokens.length, fcmResult: fcmRes, appilix: appRes })
-    };
+    return { statusCode: 200, headers: cors(), body: JSON.stringify({ ok: true, recipients: recips.length, fcmTokens: totalTokens.length, fcmResult: fcmRes, appilix: appRes }) };
   } catch (e) {
     console.error('notify error', e);
     return { statusCode: 500, headers: cors(), body: 'Internal error' };

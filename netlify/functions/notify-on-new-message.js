@@ -1,157 +1,94 @@
-// netlify/functions/notify-on-new-message.js
 const admin = require('firebase-admin');
-const { sendAppilixPush } = require('./_lib/appilix');   // ← helper ka sahi path
+const { sendAppilixPush } = require('./_lib/appilix');
 
-function initAdmin() {
-  if (!admin.apps.length) {
+function initAdmin(){
+  if (!admin.apps.length){
     const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_B64;
-    if (!b64) throw new Error('FIREBASE_SERVICE_ACCOUNT_B64 missing');
-    const obj = JSON.parse(Buffer.from(b64.trim(), 'base64').toString('utf8'));
-    if (obj.private_key) obj.private_key = obj.private_key.replace(/\\n/g, '\n');
+    const obj = JSON.parse(Buffer.from(b64.trim(),'base64').toString('utf8'));
+    if (obj.private_key) obj.private_key = obj.private_key.replace(/\\n/g,'\n');
     admin.initializeApp({ credential: admin.credential.cert(obj) });
   }
 }
-
-function parseOrigins(csv){ return String(csv || '').split(',').map(s=>s.trim()).filter(Boolean); }
-function pickOrigin(event){
-  const allowed = parseOrigins(process.env.ALLOWED_ORIGINS);
-  const hdr = event.headers || {};
-  const o = hdr.origin || hdr.Origin || (hdr.host ? `https://${hdr.host}` : '');
-  const base = (process.env.APP_BASE_URL || '').replace(/\/$/, '');
-  return allowed.includes(o) ? o : (base || allowed[0] || '*');
-}
-function buildSafeTitleBodyForChat(){ return { title:'New message received', body:'' }; }
-function chunk(arr, size){ const out=[]; for (let i=0;i<arr.length;i+=size) out.push(arr.slice(i,i+size)); return out; }
+const chunk=(a,n)=>{const o=[];for(let i=0;i<a.length;i+=n)o.push(a.slice(i,i+n));return o;};
+const safeChatTitleBody=()=>({ title:'New message received', body:'' });
 
 exports.handler = async (event) => {
   initAdmin();
   const db = admin.firestore();
+  if (event.httpMethod==='OPTIONS') return { statusCode:204, headers:{'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'*','Access-Control-Allow-Methods':'POST,OPTIONS'}, body:'' };
+  if (event.httpMethod!=='POST') return { statusCode:405, body:'Method Not Allowed' };
 
-  const ORIGIN = pickOrigin(event);
-  const cors = {
-    'Access-Control-Allow-Origin': ORIGIN,
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Vary': 'Origin',
-    'Cache-Control': 'no-store'
-  };
-
-  if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: cors, body: '' };
-  if (event.httpMethod !== 'POST')   return { statusCode: 405, headers: cors, body: 'Method Not Allowed' };
-
-  try {
+  try{
     const auth = event.headers.authorization || event.headers.Authorization || '';
-    if (!auth.startsWith('Bearer ')) return { statusCode: 401, headers: cors, body: 'Unauthorized' };
+    if (!auth.startsWith('Bearer ')) return { statusCode:401, body:'Unauthorized' };
     const decoded = await admin.auth().verifyIdToken(auth.slice(7));
 
-    const q = new URLSearchParams(event.queryStringParameters || {});
-    const dryRun = q.get('dryRun') === '1';
+    const { chatId, messageId, linkOverride } = JSON.parse(event.body||'{}');
+    if (!chatId || !messageId) return { statusCode:400, body:'chatId and messageId required' };
 
-    const { chatId, messageId, linkOverride } = JSON.parse(event.body || '{}');
-    if (!chatId || !messageId) return { statusCode: 400, headers: cors, body: 'chatId and messageId required' };
-
-    // chat & message
+    // chat + message
     const chatRef = db.collection('chats').doc(chatId);
-    const chatDoc = await chatRef.get();
-    if (!chatDoc.exists) return { statusCode: 404, headers: cors, body: 'Chat not found' };
+    const chatDoc = await chatRef.get(); if (!chatDoc.exists) return { statusCode:404, body:'Chat not found' };
     const users = chatDoc.get('users') || [];
-    if (!users.includes(decoded.uid)) return { statusCode: 403, headers: cors, body: 'Not in chat' };
+    if (!users.includes(decoded.uid)) return { statusCode:403, body:'Not in chat' };
 
     const msgSnap = await chatRef.collection('messages').doc(messageId).get();
-    if (!msgSnap.exists) return { statusCode: 404, headers: cors, body: 'Message not found' };
-    const m = msgSnap.data() || {};
-    const recipients = users.filter(u => u !== m.senderId);
-    if (!recipients.length) return { statusCode: 200, headers: cors, body: JSON.stringify({ sent:0, failed:0, reason:'No recipients' }) };
+    if (!msgSnap.exists) return { statusCode:404, body:'Message not found' };
+    const m = msgSnap.data()||{};
+    const recipients = users.filter(u=>u!==m.senderId);
+    if (!recipients.length) return { statusCode:200, body:JSON.stringify({reason:'no recipients'}) };
 
-    // collect tokens
+    // tokens
     const tokenSet = new Set();
-    const tokenOwners = new Map();
-    await Promise.all(recipients.map(async (uid) => {
+    await Promise.all(recipients.map(async (uid)=>{
       const base = db.collection('users').doc(uid);
-      const [t1, t2] = await Promise.all([
+      const [t1,t2] = await Promise.all([
         base.collection('fcmTokens').get(),
-        base.collection('pushEndpoints').where('type', 'in', ['fcm_web','native']).get()
+        base.collection('pushEndpoints').where('type','in',['fcm_web','native']).get()
       ]);
-      t1.forEach(d => { const tok=d.id; if(tok){ tokenSet.add(tok); (tokenOwners.get(tok)||tokenOwners.set(tok,new Set()).get(tok)).add(uid); }});
-      t2.forEach(d => { const x=d.data()||{}; const tok=x.token; if(tok){ tokenSet.add(tok); (tokenOwners.get(tok)||tokenOwners.set(tok,new Set()).get(tok)).add(uid); }});
+      t1.forEach(d=>d.id && tokenSet.add(d.id));
+      t2.forEach(d=>{const x=d.data()||{}; if(x.token) tokenSet.add(x.token);});
     }));
     const tokens = Array.from(tokenSet);
 
     const site = (process.env.APP_BASE_URL || 'https://bechobazaar.com').replace(/\/$/,'');
     const link = linkOverride || `${site}/chat-list.html`;
-    const tag  = chatId ? `chat_${chatId}` : 'chat_inbox';
-    const { title, body } = buildSafeTitleBodyForChat();
+    const tag = chatId ? `chat_${chatId}` : 'chat_inbox';
+    const { title, body } = safeChatTitleBody();
 
-    // ====== FCM (browsers/PWA) ======
-    let sent=0, failed=0, cleaned=0;
+    // ---- FCM (data-only) ----
+    let fcm = { sent:0, failed:0 };
     if (tokens.length){
-      const baseMsg = {
+      const msg = {
         data: {
-          title, body, url: link, tag,
-          ch: 'fcm',
-          kind: 'chat',
-          chatId: String(chatId),
-          senderId: String(m.senderId || ''),
-          messageId: String(messageId)
+          ch:'fcm', kind:'chat', title, body, url:link, tag,
+          chatId:String(chatId), messageId:String(messageId), senderId:String(m.senderId||'')
         },
-        webpush: { fcmOptions: { link }, headers: { Urgency: 'high', TTL: '600' } },
-        android: { priority: 'high', collapseKey: tag },
-        apns: { headers: { 'apns-priority': '10' } }
+        webpush: { fcmOptions:{ link }, headers:{ Urgency:'high', TTL:'600' } },
+        android: { priority:'high', collapseKey:tag },
+        apns: { headers:{ 'apns-priority':'10' } }
       };
-      const batches = chunk(tokens, 500);
-      for (const batch of batches) {
-        const res = dryRun
-          ? { successCount: batch.length, failureCount: 0, responses: batch.map(()=>({success:true})) }
-          : await admin.messaging().sendEachForMulticast({ ...baseMsg, tokens: batch });
-
-        sent   += res.successCount || 0;
-        failed += res.failureCount || 0;
-
-        if (!dryRun) {
-          for (let i=0;i<res.responses.length;i++){
-            const r = res.responses[i];
-            if (r && !r.success) {
-              const code = r.error?.code || '';
-              const isBad = code.includes('registration-token-not-registered') ||
-                            code.includes('invalid-argument') ||
-                            code.includes('messaging/registration-token-not-registered');
-              if (isBad) {
-                const bad = batch[i];
-                const owners = Array.from((tokenOwners.get(bad) || new Set()));
-                await Promise.all(owners.map(async (uid) => {
-                  try {
-                    await db.collection('users').doc(uid).collection('fcmTokens').doc(bad).delete().catch(()=>{});
-                    const qs = await db.collection('users').doc(uid).collection('pushEndpoints').where('token','==',bad).get();
-                    const dels=[]; qs.forEach(d => dels.push(d.ref.delete().catch(()=>{})));
-                    await Promise.all(dels);
-                  } catch {}
-                }));
-                cleaned += 1;
-              }
-            }
-          }
-        }
+      for (const part of chunk(tokens, 500)){
+        const res = await admin.messaging().sendEachForMulticast({...msg, tokens:part});
+        fcm.sent += res.successCount; fcm.failed += res.failureCount;
       }
     }
 
-    // ====== Appilix (APK/WebView) ======
-    const APPILIX_APP_KEY = process.env.APPILIX_APP_KEY;
-    const APPILIX_API_KEY = process.env.APPILIX_API_KEY;
+    // ---- Appilix (APK) ----
     let appilix = [];
-    if (APPILIX_APP_KEY && APPILIX_API_KEY) {
-      const pushes = recipients.map(uid => sendAppilixPush({
-        appKey: APPILIX_APP_KEY,
-        apiKey: APPILIX_API_KEY,
-        title, body,
-        user_identity: uid,
-        open_link_url: link
-      }).catch(e => ({ error: e.message, uid })));
-      appilix = await Promise.all(pushes);
+    if (process.env.APPILIX_APP_KEY && process.env.APPILIX_API_KEY){
+      appilix = await Promise.all(recipients.map(uid =>
+        sendAppilixPush({
+          appKey: process.env.APPILIX_APP_KEY,
+          apiKey: process.env.APPILIX_API_KEY,
+          title, body, user_identity: uid, open_link_url: link
+        }).catch(e=>({ ok:false, error:e.message, uid }))
+      ));
     }
 
-    return { statusCode: 200, headers: cors, body: JSON.stringify({ fcm: { sent, failed, cleaned, tokens: tokens.length }, appilix }) };
-  } catch (e) {
+    return { statusCode:200, headers:{'Cache-Control':'no-store','Access-Control-Allow-Origin':'*'}, body: JSON.stringify({ fcm, appilix }) };
+  }catch(e){
     console.error('notify-on-new-message error', e);
-    return { statusCode: 500, headers: cors, body: 'Internal Server Error' };
+    return { statusCode:500, body:'Internal Server Error' };
   }
 };

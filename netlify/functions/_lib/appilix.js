@@ -1,3 +1,5 @@
+// netlify/functions/sendAppilixPush.js
+// Node18 → global fetch
 async function sendAppilixPush({ appKey, apiKey, title, body, user_identity, open_link_url }) {
   const url = 'https://appilix.com/api/push-notification';
   const form = new URLSearchParams();
@@ -10,7 +12,7 @@ async function sendAppilixPush({ appKey, apiKey, title, body, user_identity, ope
 
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    headers: { 'Content-Type':'application/x-www-form-urlencoded' },
     body: form.toString()
   });
   const text = await res.text().catch(()=> '');

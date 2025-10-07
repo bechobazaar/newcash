@@ -1,19 +1,16 @@
 // netlify/functions/notify-on-new-message.js
-const admin = require('firebase-admin');
-const fetch = require('node-fetch');
-
-if (!admin.apps.length) {
-  admin.initializeApp({});
-}
+const { initAdminFromB64 } = require('./firebaseAdmin');
+const admin = initAdminFromB64();
 const db = admin.firestore();
 
-// Optional: Appilix push config
-const APPILIX_PUSH_URL = process.env.APPILIX_PUSH_URL || '';
-const APPILIX_KEY      = process.env.APPILIX_KEY || '';
+// Node18 → global fetch available
+const { sendAppilixPush } = (() => {
+  try { return require('./sendAppilixPush'); } catch { return { sendAppilixPush: null }; }
+})();
 
-// ---- CORS ----
-const ALLOW_ORIGIN = 'https://bechobazaar.com'; // exact origin yahin rakho
-function corsHeaders() {
+const ALLOW_ORIGIN = 'https://bechobazaar.com';
+
+function cors() {
   return {
     'Access-Control-Allow-Origin': ALLOW_ORIGIN,
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
@@ -22,7 +19,7 @@ function corsHeaders() {
   };
 }
 
-// ---- helpers (same as before) ----
+// ---- helpers ----
 async function getRecipients(chatId, excludeUid) {
   const c = await db.collection('chats').doc(chatId).get();
   if (!c.exists) return [];
@@ -48,20 +45,6 @@ async function sendFCM(tokens, payload) {
   const res = await admin.messaging().sendToDevice(tokens, payload, { priority: 'high' });
   return { ok: true, res };
 }
-async function sendAppilix(endpoints, title, body, url) {
-  if (!APPILIX_PUSH_URL || !APPILIX_KEY) return { ok: true };
-  const nativeTargets = endpoints.filter(e => (e.type || '').startsWith('appilix'));
-  if (!nativeTargets.length) return { ok: true };
-  try{
-    const payload = { title, body, url, endpoints: nativeTargets.map(n => n.token || n.id) };
-    const r = await fetch(APPILIX_PUSH_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': APPILIX_KEY },
-      body: JSON.stringify(payload)
-    });
-    return { ok: r.ok, status: r.status };
-  }catch(e){ return { ok: false, error: String(e) }; }
-}
 function makeNotificationPayload({ title, body, url, tag }) {
   return {
     data: {
@@ -72,52 +55,74 @@ function makeNotificationPayload({ title, body, url, tag }) {
     }
   };
 }
+async function sendAppilix(endpoints, title, body, url) {
+  if (!sendAppilixPush) return { ok: true };
+  const appKey = process.env.APPILIX_APP_KEY;
+  const apiKey = process.env.APPILIX_API_KEY;
+  if (!appKey || !apiKey) return { ok: true };
+
+  const nativeTargets = endpoints.filter(e => (e.type || '').startsWith('appilix'));
+  if (!nativeTargets.length) return { ok: true };
+
+  const absUrl = new URL(url, 'https://bechobazaar.com').href;
+  const results = [];
+  for (const e of nativeTargets) {
+    const user_identity = e.token || e.id;
+    try {
+      results.push(await sendAppilixPush({ appKey, apiKey, title, body, user_identity, open_link_url: absUrl }));
+    } catch (err) {
+      results.push({ ok:false, error:String(err) });
+    }
+  }
+  return { ok: true, count: results.length, results };
+}
 
 // ---- Netlify handler ----
 exports.handler = async (event) => {
   // Preflight
   if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: corsHeaders(), body: '' };
+    return { statusCode: 204, headers: cors(), body: '' };
   }
 
-  try{
+  try {
     if (event.httpMethod !== 'POST') {
-      return { statusCode: 405, headers: corsHeaders(), body: 'Method Not Allowed' };
+      return { statusCode: 405, headers: cors(), body: 'Method Not Allowed' };
     }
-    const headers = event.headers || {};
-    const auth = headers.authorization || '';
-    const m = auth.match(/^Bearer\s+(.+)$/i);
+
+    const authH = (event.headers && (event.headers.authorization || event.headers.Authorization)) || '';
+    const m = authH.match(/^Bearer\s+(.+)$/i);
     if (!m) {
-      return { statusCode: 401, headers: corsHeaders(), body: 'Missing bearer token' };
+      return { statusCode: 401, headers: cors(), body: 'Missing bearer token' };
     }
+
+    // Verify Firebase ID token (now tied to your SA project)
     let decoded;
-    try{
-      decoded = await admin.auth().verifyIdToken(m[1]);
-    }catch(e){
-      return { statusCode: 401, headers: corsHeaders(), body: 'Invalid token' };
+    try {
+      decoded = await admin.auth().verifyIdToken(m[1], false);
+    } catch (e) {
+      console.error('[AUTH] verifyIdToken error', { code: e.code, message: e.message });
+      return { statusCode: 401, headers: cors(), body: `Invalid token (${e.code || 'unknown'}): ${e.message || ''}` };
     }
 
     const body = JSON.parse(event.body || '{}');
     const { chatId, messageId } = body;
     if (!chatId || !messageId) {
-      return { statusCode: 400, headers: corsHeaders(), body: 'chatId and messageId required' };
+      return { statusCode: 400, headers: cors(), body: 'chatId and messageId required' };
     }
 
     const msg = await getMessage(chatId, messageId);
-    if (!msg) {
-      return { statusCode: 404, headers: corsHeaders(), body: 'message not found' };
-    }
+    if (!msg) return { statusCode: 404, headers: cors(), body: 'message not found' };
 
     const senderUid = msg.senderId || decoded.uid;
     const recips = await getRecipients(chatId, senderUid);
     if (!recips.length) {
-      return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify({ ok: true, sent: 0 }) };
+      return { statusCode: 200, headers: cors(), body: JSON.stringify({ ok: true, sent: 0 }) };
     }
 
     const title = msg.senderName ? `${msg.senderName}` : 'New message';
-    const bodyTxt  = msg.text ? msg.text.slice(0, 80) : 'Tap to view';
-    const url   = `/chat.html?chatId=${encodeURIComponent(chatId)}`;
-    const tag   = `chat_${chatId}`;
+    const bodyTxt = msg.text ? msg.text.slice(0, 80) : 'Tap to view';
+    const url  = `/chat.html?chatId=${encodeURIComponent(chatId)}`;
+    const tag  = `chat_${chatId}`;
     const payload = makeNotificationPayload({ title, body: bodyTxt, url, tag });
 
     let totalTokens = [];
@@ -133,7 +138,7 @@ exports.handler = async (event) => {
 
     return {
       statusCode: 200,
-      headers: corsHeaders(),
+      headers: cors(),
       body: JSON.stringify({
         ok: true,
         recipients: recips.length,
@@ -142,8 +147,8 @@ exports.handler = async (event) => {
         appilix: appRes
       })
     };
-  }catch(e){
+  } catch (e) {
     console.error('notify error', e);
-    return { statusCode: 500, headers: corsHeaders(), body: 'Internal error' };
+    return { statusCode: 500, headers: cors(), body: 'Internal error' };
   }
 };

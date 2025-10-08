@@ -1,69 +1,119 @@
 // netlify/functions/notify-on-new-message.js
-const admin = require('firebase-admin');
+// Node18 + global fetch
 
+const admin = require('firebase-admin');
 if (!admin.apps.length) {
-  admin.initializeApp(); // Netlify env me GOOGLE_APPLICATION_CREDENTIALS set honi chahiye
+  admin.initializeApp({
+    credential: admin.credential.applicationDefault(),
+    // Firestore URL if needed:
+    // databaseURL: process.env.FB_DB_URL
+  });
 }
 const db = admin.firestore();
-const messaging = admin.messaging();
 
-const json = (code, body) => ({
-  statusCode: code,
-  headers: {
-    'content-type': 'application/json',
-    'access-control-allow-origin': '*',
-    'access-control-allow-methods': 'POST, OPTIONS',
-  },
-  body: JSON.stringify(body),
-});
+const FCM_KEY = process.env.FCM_SERVER_KEY; // <- set in Netlify env
 
 exports.handler = async (event) => {
-  if (event.httpMethod === 'OPTIONS') return json(204, {});
+  if (event.httpMethod !== 'POST') {
+    return { statusCode: 405, body: 'Method Not Allowed' };
+  }
+
+  // optional auth check (recommended)
+  const auth = event.headers.authorization || '';
+  if (!auth.startsWith('Bearer ')) {
+    return { statusCode: 401, body: 'Missing token' };
+  }
+  try { await admin.auth().verifyIdToken(auth.slice(7)); }
+  catch { return { statusCode: 401, body: 'Invalid token' }; }
+
   try {
-    const { chatId, messageId, targetUid, excludeUid } = JSON.parse(event.body || '{}');
-    if (!chatId) return json(400, { error: 'chatId required' });
+    const { chatId, messageId, recipientUid } = JSON.parse(event.body || '{}');
+    if (!chatId || !messageId) {
+      return { statusCode: 400, body: 'chatId & messageId required' };
+    }
+    if (!FCM_KEY) {
+      return { statusCode: 500, body: 'FCM_SERVER_KEY missing' };
+    }
 
-    // message / sender / preview
+    // --- Load message (to know senderId & text)
     const msgDoc = await db.collection('chats').doc(chatId)
-      .collection('messages').doc(messageId).get().catch(()=>null);
-    const msg = msgDoc && msgDoc.exists ? msgDoc.data() : {};
-    const senderId = msg.senderId || excludeUid || null;
+      .collection('messages').doc(messageId).get();
+    if (!msgDoc.exists) return { statusCode: 404, body: 'message not found' };
+    const msg = msgDoc.data() || {};
+    const senderId = msg.senderId;
 
-    // recipients
+    // --- Compute recipients
     let recipients = [];
-    if (targetUid) {
-      recipients = [targetUid];
+    if (recipientUid) {
+      // client ne explicitly bola kisey push deni hai
+      if (recipientUid !== senderId) recipients = [recipientUid];
     } else {
+      // chat doc se nikalo, sender ko exclude
       const chatDoc = await db.collection('chats').doc(chatId).get();
-      const users = chatDoc.exists ? (chatDoc.data().users || []) : [];
-      recipients = users.filter(u => u && u !== senderId); // <<--- EXCLUDE SENDER
+      const users = (chatDoc.data()?.users || []).filter(u => u && u !== senderId);
+      recipients = [...new Set(users)];
     }
-    recipients = [...new Set(recipients)];
+    if (!recipients.length) {
+      return { statusCode: 200, body: JSON.stringify({ ok:true, sent:0, note:'no recipients' }) };
+    }
 
-    if (!recipients.length) return json(200, { sent: 0, note: 'no recipients' });
-
-    // collect FCM tokens only for recipients
-    const tokens = [];
+    // --- Collect ONLY recipients’ FCM tokens
+    const tokens = new Set();
     for (const uid of recipients) {
-      // aap save kar rahe ho: users/{uid}/fcmTokens/{token}
       const snap = await db.collection('users').doc(uid).collection('fcmTokens').get();
-      snap.forEach(d => tokens.push(d.id || d.data()?.token));
+      snap.forEach(d => {
+        const t = d.id || d.data()?.token;
+        if (t) tokens.add(String(t));
+      });
+      // (optional) include web push/fcm_web stored in pushEndpoints
+      const ep = await db.collection('users').doc(uid)
+        .collection('pushEndpoints')
+        .where('type', 'in', ['fcm_web', 'fcm'])
+        .get();
+      ep.forEach(d => { const t = d.data()?.token; if (t) tokens.add(String(t)); });
     }
-    const uniq = [...new Set(tokens)].filter(Boolean);
-    if (!uniq.length) return json(200, { sent: 0, note: 'no tokens' });
 
-    const title = 'New message';
-    const body  = (msg.text && String(msg.text).slice(0, 80)) || 'You have a new message';
+    const tokenList = [...tokens];
+    if (tokenList.length === 0) {
+      return { statusCode: 200, body: JSON.stringify({ ok:true, sent:0, note:'no tokens' }) };
+    }
+
+    // --- Build FCM payload
+    const bodyText = (msg.text && msg.text.trim()) ? msg.text.trim() : 'New message received';
     const openLink = `https://bechobazaar.com/chat-list?open_conversation=${encodeURIComponent(chatId)}`;
 
     const payload = {
-      notification: { title, body },
-      data: { chatId, open_link_url: openLink }
+      registration_ids: tokenList,
+      notification: {
+        title: 'New message',
+        body: bodyText,
+        click_action: openLink,        // web
+      },
+      data: {
+        open_link_url: openLink,       // native/web both
+        chat_id: chatId,
+        message_id: messageId,
+        type: 'chat_new_message'
+      },
+      android: { priority: 'high' },
+      priority: 'high'
     };
 
-    const resp = await messaging.sendToDevice(uniq, payload, { priority: 'high' });
-    return json(200, { sent: resp.successCount, fail: resp.failureCount });
+    const res = await fetch('https://fcm.googleapis.com/fcm/send', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `key=${FCM_KEY}`
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const txt = await res.text();
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ ok:true, status: res.status, recipients, tokens: tokenList.length, fcm: txt })
+    };
   } catch (e) {
-    return json(500, { error: e.message });
+    return { statusCode: 500, body: JSON.stringify({ ok:false, error: String(e) }) };
   }
 };

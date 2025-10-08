@@ -1,168 +1,101 @@
-// netlify/functions/notify-on-new-message.js (Node 18)
-// ENV required: FIREBASE_SERVICE_ACCOUNT_B64, APPILIX_APP_KEY, APPILIX_API_KEY
-// Optional: ALLOW_ORIGINS (CSV) e.g. "https://bechobazaar.com,https://bechobazaar.netlify.app"
-
+// netlify/functions/notify-on-new-message.js
 const admin = require('firebase-admin');
+const fetch = global.fetch;
 
-function initAdmin(){
-  if (admin.apps.length) return;
-  const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_B64;
-  if (!b64) throw new Error('FIREBASE_SERVICE_ACCOUNT_B64 missing');
-  const json = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
-  admin.initializeApp({ credential: admin.credential.cert(json) });
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.applicationDefault(), // Netlify env me GOOGLE_APPLICATION_CREDENTIALS set hona chahiye
+  });
 }
-initAdmin();
-
 const db = admin.firestore();
 
-function cors(res){
-  const allow = (process.env.ALLOW_ORIGINS || '*');
-  res.setHeader('Access-Control-Allow-Origin', allow);
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-}
+exports.handler = async (event) => {
+  try {
+    if (event.httpMethod === 'OPTIONS') return resp(204, null);
 
-async function getRecipients(chatId, excludeUid){
-  const doc = await db.collection('chats').doc(chatId).get();
-  if (!doc.exists) return [];
-  const members = Array.isArray(doc.data().members) ? doc.data().members : [];
-  return members.filter(u => u && u !== excludeUid);
-}
+    // Optional: verify Firebase ID token from Authorization header (Bearer …) if you want
+    const { chatId, messageId } = JSON.parse(event.body || '{}');
+    if (!chatId || !messageId) return resp(400, { ok:false, error:'chatId/messageId missing' });
 
-async function getUserTokens(uid){
-  const tokens = [];
-  const endpoints = [];
-  const tokSnap = await db.collection('users').doc(uid).collection('fcmTokens').get();
-  tokSnap.forEach(d => tokens.push(d.id));
-  const endSnap = await db.collection('users').doc(uid).collection('pushEndpoints').get();
-  endSnap.forEach(d => endpoints.push({ id:d.id, ...d.data() }));
-  return { tokens, endpoints };
-}
+    // Chat + message fetch
+    const chatRef = db.collection('chats').doc(chatId);
+    const chat = (await chatRef.get()).data() || {};
+    const msg  = (await chatRef.collection('messages').doc(messageId).get()).data() || {};
 
-// Appilix API (form-urlencoded)
-async function sendAppilixPush({ appKey, apiKey, title, body, user_identity, open_link_url }){
-  const url  = 'https://appilix.com/api/push-notification';
-  const form = new URLSearchParams();
-  form.set('app_key', appKey);
-  form.set('api_key', apiKey);
-  form.set('notification_title', title || 'Notification');
-  form.set('notification_body',  body  || '');
-  if (user_identity) form.set('user_identity', user_identity);
-  if (open_link_url) form.set('open_link_url', open_link_url);
+    const sender = msg.senderId;
+    const [a,b]  = chat.users || [];
+    const recipientUid = (a === sender) ? b : a;
 
-  const r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: form.toString() });
-  const text = await r.text().catch(()=> '');
-  if (!r.ok) return { ok:false, status:r.status, text };
-  return { ok:true, status:r.status, text };
-}
+    if (!recipientUid) return resp(400, { ok:false, error:'recipient not resolved' });
 
-function makeDataPayload({ title, body, url, tag }){
-  return {
-    data: {
-      title: title || 'New message',
-      body:  body  || 'You have a new message',
-      url:   url   || '/chat-list',
-      tag:   tag   || 'chat_inbox'
-    }
-  };
-}
+    // Construct open link (Appilix will open this)
+    const openLink = `https://bechobazaar.com/chat-list?open_conversation=${encodeURIComponent(chatId)}`;
+    const preview  = (msg.text && msg.text.trim()) || 'New message received';
 
-exports.handler = async (event, context) => {
-  const resHeaders = {};
-  try{
-    if (event.httpMethod === 'OPTIONS') {
-      return { statusCode: 200, headers: {
-        'Access-Control-Allow-Origin': process.env.ALLOW_ORIGINS || '*',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-        'Access-Control-Allow-Methods': 'POST, OPTIONS'
-      }};
-    }
-
-    const headers = event.headers || {};
-    const auth = headers.authorization || headers.Authorization || '';
-    const m = auth.match(/^Bearer\s+(.+)$/i);
-    if (!m) {
-      return { statusCode: 401, headers: {'Access-Control-Allow-Origin': process.env.ALLOW_ORIGINS || '*'}, body: 'Missing bearer token' };
-    }
-
-    const decoded = await admin.auth().verifyIdToken(m[1]).catch(()=>null);
-    if (!decoded) {
-      return { statusCode: 401, headers: {'Access-Control-Allow-Origin': process.env.ALLOW_ORIGINS || '*'}, body: 'Invalid token' };
-    }
-
-    const body = JSON.parse(event.body || '{}');
-    const { chatId, messageId } = body;
-    if (!chatId || !messageId) {
-      return { statusCode: 400, headers: {'Access-Control-Allow-Origin': process.env.ALLOW_ORIGINS || '*'}, body: 'chatId and messageId required' };
-    }
-
-    const msgSnap = await db.collection('chats').doc(chatId).collection('messages').doc(messageId).get();
-    if (!msgSnap.exists) {
-      return { statusCode: 404, headers: {'Access-Control-Allow-Origin': process.env.ALLOW_ORIGINS || '*'}, body: 'message not found' };
-    }
-    const msg = { id: msgSnap.id, ...msgSnap.data() };
-    const senderUid = msg.senderId || decoded.uid;
-
-    const recips = await getRecipients(chatId, senderUid);
-    if (!recips.length) {
-      return { statusCode: 200, headers: {'Access-Control-Allow-Origin': process.env.ALLOW_ORIGINS || '*'}, body: JSON.stringify({ ok:true, sent:0 }) };
-    }
-
-    // collect tokens and (optional) appilix identities
-    let fcmTokens = [];
-    let identities = [];
-    for (const uid of recips){
-      const { tokens, endpoints } = await getUserTokens(uid);
-      fcmTokens = fcmTokens.concat(tokens);
-      // If you use Appilix "user_identity" = uid (recommended)
-      identities.push(uid);
-    }
-
-    const title = msg.senderName ? `${msg.senderName}` : 'New message';
-    const bodyText = msg.text ? String(msg.text).slice(0,80) : 'Tap to view';
-    const deepLink = `/chat?chatId=${encodeURIComponent(chatId)}`;
-    const tag  = `chat_${chatId}`;
-    const payload = makeDataPayload({ title, body: bodyText, url: deepLink, tag });
-
-    // FCM (web push)
-    let fcmResp = null;
-    if (fcmTokens.length){
-      fcmResp = await admin.messaging().sendMulticast({
-        tokens: fcmTokens,
-        data: payload.data
-      });
-    }
-
-    // Appilix push (per user_identity)
-    let appResp = null;
-    if (process.env.APPILIX_APP_KEY && process.env.APPILIX_API_KEY) {
-      // You can call once per uid, here simple single call with sender info
-      appResp = await sendAppilixPush({
-        appKey: process.env.APPILIX_APP_KEY,
-        apiKey: process.env.APPILIX_API_KEY,
-        title,
-        body: bodyText,
-        user_identity: identities[0],     // or loop over identities to send individually
-        open_link_url: deepLink
-      });
-    }
-
-    return {
-      statusCode: 200,
-      headers: {'Access-Control-Allow-Origin': process.env.ALLOW_ORIGINS || '*'},
+    // ---- Try Appilix targeted first
+    const appilixRes = await fetch(process.env.SEND_APPILIX_PUSH_URL /* set env to the function URL */, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
-        ok: true,
-        recipients: recips.length,
-        fcmTokens: fcmTokens.length,
-        fcm: fcmResp,
-        appilix: appResp
+        user_identity: recipientUid,
+        title:'New message',
+        message: preview,
+        open_link_url: openLink
       })
+    });
+    const appilixText = await appilixRes.text();
+    let appilixOK = false;
+    try { appilixOK = JSON.parse(appilixText)?.ok === true && /"status"\s*:\s*"true"/i.test(appilixText); } catch {}
+
+    if (appilixOK) {
+      // mark delivered flag quickly
+      await chatRef.collection('messages').doc(messageId).set({ delivered:true }, { merge:true });
+      return resp(200, { ok:true, via:'appilix', result:appilixText });
+    }
+
+    // ---- Fallback: FCM only to recipient's saved tokens (native/web)
+    const tokens = new Set();
+
+    // legacy web FCM tokens (if you already save under users/{uid}/fcmTokens)
+    const fcmSnap = await db.collection('users').doc(recipientUid).collection('fcmTokens').get();
+    fcmSnap.forEach(d => d.exists && d.data()?.token && tokens.add(d.data().token));
+
+    // endpoints collection (we saved in frontend) — you can also mirror native tokens to FCM if applicable
+    const endSnap = await db.collection('users').doc(recipientUid).collection('pushEndpoints').get();
+    endSnap.forEach(d=>{
+      const x = d.data() || {};
+      // If you also store FCM web tokens here you can add them similarly.
+      if (x.type === 'fcm_web' && x.token) tokens.add(x.token);
+    });
+
+    if (!tokens.size) return resp(200, { ok:false, via:'none', reason:'no-tokens' });
+
+    const payload = {
+      notification: { title:'New message', body: preview },
+      data: {
+        chatId, messageId,
+        open_link_url: openLink
+      }
     };
-  }catch(e){
-    return {
-      statusCode: 500,
-      headers: {'Access-Control-Allow-Origin': process.env.ALLOW_ORIGINS || '*'},
-      body: 'Internal error: ' + (e?.message || String(e))
-    };
+    const result = await admin.messaging().sendToDevice([...tokens], payload, { priority:'high' });
+
+    await chatRef.collection('messages').doc(messageId).set({ delivered:true }, { merge:true });
+
+    return resp(200, { ok:true, via:'fcm', result });
+  } catch (e) {
+    return resp(500, { ok:false, error:String(e) });
   }
 };
+
+function resp(code, body){
+  return {
+    statusCode: code,
+    headers:{
+      'Access-Control-Allow-Origin':'*',
+      'Access-Control-Allow-Methods':'POST,OPTIONS',
+      'Access-Control-Allow-Headers':'Content-Type,Authorization',
+      'Content-Type':'application/json'
+    },
+    body: body==null ? '' : JSON.stringify(body)
+  };
+}

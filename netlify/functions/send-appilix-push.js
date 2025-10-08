@@ -1,6 +1,11 @@
 // netlify/functions/send-appilix-push.js
-// Node 18+ (Netlify has global fetch)
-const allowedMethods = ['POST'];
+const allowedMethods = ['POST','OPTIONS'];
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',                      // ya yahan apna origin daalo: 'https://bechobazaar.com'
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS'
+};
 
 async function sendPushToAppilix({ appKey, apiKey, title, body, user_identity, open_link_url }) {
   const url = 'https://appilix.com/api/push-notification';
@@ -25,27 +30,30 @@ async function sendPushToAppilix({ appKey, apiKey, title, body, user_identity, o
 
 exports.handler = async function (event) {
   try {
+    // --- CORS preflight
+    if (event.httpMethod === 'OPTIONS') {
+      return { statusCode: 204, headers: corsHeaders, body: '' };
+    }
+
     if (!allowedMethods.includes(event.httpMethod)) {
-      return { statusCode: 405, body: 'Method Not Allowed' };
+      return { statusCode: 405, headers: corsHeaders, body: 'Method Not Allowed' };
     }
 
     const payload = JSON.parse(event.body || '{}');
 
-    // Read keys from env — set these in Netlify dashboard (BUILD & DEPLOY > Environment)
     const APPILIX_APP_KEY = process.env.APPILIX_APP_KEY;
     const APPILIX_API_KEY = process.env.APPILIX_API_KEY;
-
     if (!APPILIX_APP_KEY || !APPILIX_API_KEY) {
-      return { statusCode: 500, body: 'Missing Appilix keys in environment' };
+      return { statusCode: 500, headers: corsHeaders, body: 'Missing Appilix keys in environment' };
     }
 
-    // Required fields from caller
     const { title, message, user_identity, open_link_url } = payload;
-    if (!message) return { statusCode: 400, body: 'missing message' };
+    if (!message) {
+      return { statusCode: 400, headers: corsHeaders, body: 'missing message' };
+    }
 
-    // Compose notification title & body (customize as needed)
     const notificationTitle = title || 'New message received';
-    const notificationBody = message.length > 120 ? message.slice(0, 117) + '...' : message;
+    const notificationBody  = message.length > 120 ? message.slice(0,117)+'…' : message;
 
     const result = await sendPushToAppilix({
       appKey: APPILIX_APP_KEY,
@@ -56,12 +64,9 @@ exports.handler = async function (event) {
       open_link_url
     });
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify({ ok: true, result })
-    };
+    return { statusCode: 200, headers: corsHeaders, body: JSON.stringify({ ok: true, result }) };
   } catch (err) {
     console.error('send-appilix-push error:', err);
-    return { statusCode: 500, body: JSON.stringify({ ok: false, error: err.message }) };
+    return { statusCode: 500, headers: corsHeaders, body: JSON.stringify({ ok: false, error: err.message }) };
   }
 };

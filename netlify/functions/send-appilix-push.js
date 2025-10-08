@@ -2,10 +2,11 @@
 const allowedMethods = ['POST','OPTIONS'];
 
 const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',                      // ya yahan apna origin daalo: 'https://bechobazaar.com'
+  'Access-Control-Allow-Origin': 'https://bechobazaar.com',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   'Access-Control-Allow-Methods': 'POST, OPTIONS'
 };
+
 
 async function sendPushToAppilix({ appKey, apiKey, title, body, user_identity, open_link_url }) {
   const url = 'https://appilix.com/api/push-notification';

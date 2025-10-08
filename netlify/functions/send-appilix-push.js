@@ -1,54 +1,38 @@
 // netlify/functions/send-appilix-push.js
-// Node 18+ global fetch
+export async function handler(event) {
+  const cors = {
+    'Access-Control-Allow-Origin': event.headers.origin || 'https://bechobazaar.com',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS'
+  };
+  if (event.httpMethod === 'OPTIONS') return { statusCode:204, headers:cors, body:'' };
 
-exports.handler = async (event) => {
   try {
-    if (event.httpMethod === 'OPTIONS') {
-      return resp(204, null);
-    }
+    const { user_identity, title, message, open_link_url } = JSON.parse(event.body || '{}');
 
-    const body = JSON.parse(event.body || '{}');
-    const { user_identity, title, message, open_link_url } = body;
-
-    if (!user_identity) {
-      return resp(400, { ok:false, error:'missing_user_identity' }); // no broadcast
+    const appKey = process.env.APPILIX_APP_KEY;
+    const apiKey = process.env.APPILIX_API_KEY;
+    if (!appKey || !apiKey) {
+      return { statusCode:500, headers:cors, body: JSON.stringify({ ok:false, error:'Missing Appilix keys' }) };
     }
 
     const form = new URLSearchParams();
-    form.set('app_key', process.env.APPILIX_APP_KEY);
-    form.set('api_key', process.env.APPILIX_API_KEY);
+    form.set('app_key', appKey);
+    form.set('api_key', apiKey);
     form.set('notification_title', title || 'Notification');
     form.set('notification_body', message || '');
-    form.set('user_identity', user_identity);
+    if (user_identity) form.set('user_identity', user_identity);   // targeted
     if (open_link_url) form.set('open_link_url', open_link_url);
 
-    const r = await fetch('https://appilix.com/api/push-notification', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: form.toString(),
+    const resp = await fetch('https://appilix.com/api/push-notification', {
+      method:'POST',
+      headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
+      body: form.toString()
     });
 
-    const text = await r.text();
-    // Appilix string JSON deta hai: {"status":"true"} ya {"status":"false","msg":"..."}
-    let parsed = {};
-    try { parsed = JSON.parse(text); } catch {}
-    const ok = parsed?.status === 'true';
-
-    return resp(200, { ok, status: r.status, text });
-  } catch (e) {
-    return resp(500, { ok:false, error: String(e) });
+    const text = await resp.text(); // e.g. {"status":"true"} or {"status":"false", "msg":"User identity is not found."}
+    return { statusCode:200, headers:cors, body: JSON.stringify({ ok:true, result:{ status: resp.status, text } }) };
+  } catch (err) {
+    return { statusCode:500, headers:cors, body: JSON.stringify({ ok:false, error:String(err?.message||err) }) };
   }
-};
-
-function resp(code, body) {
-  return {
-    statusCode: code,
-    headers: {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'POST,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-      'Content-Type': 'application/json',
-    },
-    body: body==null ? '' : JSON.stringify(body),
-  };
 }

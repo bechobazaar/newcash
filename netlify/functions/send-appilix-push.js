@@ -5,10 +5,7 @@ export async function handler(event) {
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Allow-Methods': 'POST, OPTIONS'
   };
-
-  if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: cors, body: '' };
-  }
+  if (event.httpMethod === 'OPTIONS') return { statusCode:204, headers:cors, body:'' };
 
   try {
     const { user_identity, title, message, open_link_url } = JSON.parse(event.body || '{}');
@@ -16,7 +13,7 @@ export async function handler(event) {
     const appKey = process.env.APPILIX_APP_KEY;
     const apiKey = process.env.APPILIX_API_KEY;
     if (!appKey || !apiKey) {
-      return { statusCode: 500, headers: cors, body: JSON.stringify({ ok:false, error:'Missing Appilix keys' }) };
+      return { statusCode:500, headers:cors, body: JSON.stringify({ ok:false, error:'Missing Appilix keys' }) };
     }
 
     const form = new URLSearchParams();
@@ -33,9 +30,9 @@ export async function handler(event) {
       body: form.toString()
     });
 
-    const text = await resp.text(); // Appilix returns JSON(string)
-    return { statusCode: 200, headers: cors, body: JSON.stringify({ ok:true, result:{ status: resp.status, text } }) };
+    const text = await resp.text(); // e.g. {"status":"true"} or {"status":"false", "msg":"User identity is not found."}
+    return { statusCode:200, headers:cors, body: JSON.stringify({ ok:true, result:{ status: resp.status, text } }) };
   } catch (err) {
-    return { statusCode: 500, headers: cors, body: JSON.stringify({ ok:false, error:String(err?.message||err) }) };
+    return { statusCode:500, headers:cors, body: JSON.stringify({ ok:false, error:String(err?.message||err) }) };
   }
 }

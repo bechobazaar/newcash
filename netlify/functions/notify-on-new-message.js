@@ -1,11 +1,12 @@
 // netlify/functions/notify-on-new-message.js
-// CORS allow-list
 const ALLOWED_ORIGINS = new Set([
   'https://bechobazaar.com',
   'https://www.bechobazaar.com',
+  // dev:
   'http://localhost:3000',
   'http://localhost:5173',
 ]);
+
 function corsHeaders(origin) {
   const allow = ALLOWED_ORIGINS.has(origin) ? origin : 'https://bechobazaar.com';
   return {
@@ -13,57 +14,40 @@ function corsHeaders(origin) {
     'Vary': 'Origin',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    // 'Access-Control-Allow-Credentials': 'true', // if you ever need it
   };
 }
 
-// ---- Firebase Admin init (Netlify envs recommended) ----
 const admin = require('firebase-admin');
-
 if (!admin.apps.length) {
-  // Prefer GOOGLE_APPLICATION_CREDENTIALS (JSON) in Netlify env, else use individual env vars
-  try {
-    // If you store the full service account JSON in env var FIREBASE_SERVICE_ACCOUNT
-    const svcJson = process.env.FIREBASE_SERVICE_ACCOUNT;
-    if (svcJson) {
-      admin.initializeApp({
-        credential: admin.credential.cert(JSON.parse(svcJson)),
-      });
-    } else {
-      // Or default creds (works if GOOGLE_APPLICATION_CREDENTIALS is set)
-      admin.initializeApp();
-    }
-  } catch (e) {
-    console.error('Admin init error', e);
-    throw e;
-  }
+  const svcJson = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (svcJson) admin.initializeApp({ credential: admin.credential.cert(JSON.parse(svcJson)) });
+  else admin.initializeApp();
 }
-
 const db = admin.firestore();
 
 exports.handler = async (event) => {
-  const origin = event.headers?.origin || '';
+  const origin  = event.headers?.origin || '';
   const headers = corsHeaders(origin);
 
-  // Preflight
+  // --- CORS preflight must return CORS headers ---
   if (event.httpMethod === 'OPTIONS') {
     return { statusCode: 200, headers, body: 'OK' };
   }
+
   if (event.httpMethod !== 'POST') {
     return { statusCode: 405, headers, body: 'Method Not Allowed' };
   }
 
   try {
-    // ----- Auth: verify idToken from browser -----
+    // Auth
     const authz = event.headers?.authorization || '';
     if (!/^Bearer\s.+/.test(authz)) {
       return { statusCode: 401, headers, body: 'Missing Authorization' };
     }
     const idToken = authz.replace(/^Bearer\s+/, '');
-    let senderUid;
-    try {
-      const decoded = await admin.auth().verifyIdToken(idToken);
-      senderUid = decoded.uid;
-    } catch (e) {
+    const decoded = await admin.auth().verifyIdToken(idToken).catch(() => null);
+    if (!decoded) {
       return { statusCode: 401, headers, body: 'Invalid token' };
     }
 
@@ -72,53 +56,59 @@ exports.handler = async (event) => {
       return { statusCode: 400, headers, body: 'chatId & messageId required' };
     }
 
-    // ----- Resolve recipient from chat -----
+    // Resolve recipient
     const chatDoc = await db.collection('chats').doc(chatId).get();
-    if (!chatDoc.exists) {
-      return { statusCode: 404, headers, body: 'Chat not found' };
-    }
+    if (!chatDoc.exists) return { statusCode: 404, headers, body: 'Chat not found' };
     const users = Array.isArray(chatDoc.data().users) ? chatDoc.data().users : [];
-    const recipientUid = users.find(u => u !== senderUid);
-    if (!recipientUid) {
-      return { statusCode: 400, headers, body: 'Recipient not found' };
-    }
+    const recipientUid = users.find(u => u !== decoded.uid);
+    if (!recipientUid) return { statusCode: 400, headers, body: 'Recipient not found' };
 
-    // ----- Collect FCM tokens from users/{uid}/fcmTokens -----
-    const tokensSnap = await db.collection('users').doc(recipientUid).collection('fcmTokens').get();
+    // Collect tokens
+    const snap = await db.collection('users').doc(recipientUid).collection('fcmTokens').get();
     const tokens = [];
-    tokensSnap.forEach(d => {
-      const tok = d.id || d.data()?.token;
-      if (tok) tokens.push(tok);
-    });
+    snap.forEach(d => { const t = d.id || d.data()?.token; if (t) tokens.push(t); });
     if (!tokens.length) {
-      // No tokens — nothing to send
       return { statusCode: 200, headers, body: JSON.stringify({ ok: true, sent: 0, reason: 'no-tokens' }) };
     }
 
-    // ----- Compose data payload for your SW handler -----
+    // FCM payload (data-only; your SW reads data.title/body/open_link_url)
     const openUrl = `https://bechobazaar.com/chat-list?open_conversation=${encodeURIComponent(chatId)}`;
-    const title   = 'New message';
-    const body    = (previewText && String(previewText).trim()) || 'New message received';
-
-    // Use data payload (works with firebase-messaging-sw.js setBackgroundMessageHandler)
     const message = {
       tokens,
       data: {
-        title,
-        body,
-        chatId,
-        messageId,
-        open_link_url: openUrl,
-        // optional extras:
-        click_action: openUrl,
+        title: 'New message',
+        body: (previewText && String(previewText).trim()) || 'New message received',
+        chatId, messageId, open_link_url: openUrl, click_action: openUrl,
       },
-      // (optional) webpush headers if you like richer behavior
-      webpush: {
-        fcm_options: { link: openUrl },
-        headers: {
-          Urgency: 'high',
-        },
-      },
+      webpush: { fcm_options: { link: openUrl }, headers: { Urgency: 'high' } },
     };
 
-    const resp = await admin.messaging().sendEachForMulticast(mess
+    const resp = await admin.messaging().sendEachForMulticast(message);
+
+    // Cleanup invalid tokens
+    const bad = [];
+    resp.responses.forEach((r, i) => {
+      if (!r.success) {
+        const code = r.error?.code || '';
+        if (code === 'messaging/registration-token-not-registered' || code === 'messaging/invalid-registration-token') {
+          bad.push(tokens[i]);
+        }
+      }
+    });
+    if (bad.length) {
+      const batch = db.batch();
+      bad.forEach(tk => batch.delete(db.collection('users').doc(recipientUid).collection('fcmTokens').doc(tk)));
+      await batch.commit().catch(()=>{});
+    }
+
+    // Optional quick delivered mark
+    try {
+      await db.collection('chats').doc(chatId).collection('messages').doc(messageId)
+        .set({ delivered: true }, { merge: true });
+    } catch (_) {}
+
+    return { statusCode: 200, headers, body: JSON.stringify({ ok: true, sent: resp.successCount || 0, fail: resp.failureCount || 0 }) };
+  } catch (e) {
+    return { statusCode: 500, headers, body: JSON.stringify({ ok: false, error: String(e?.message || e) }) };
+  }
+};

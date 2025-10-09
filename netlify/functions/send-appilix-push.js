@@ -24,18 +24,18 @@ exports.handler = async (event)=>{
   try{
     const { user_identity, title, message, open_link_url } = JSON.parse(event.body||'{}');
 
-    // ==== REAL CALL (example – fill your Appilix details) ====
+    // ---- REAL API CALL EXAMPLE (fill with your Appilix credentials) ----
     // const r = await fetch(process.env.APPILIX_PUSH_URL, {
     //   method:'POST',
     //   headers:{
     //     'Content-Type':'application/json',
-    //     'Authorization':`Bearer ${process.env.APPILIX_API_KEY}`
+    //     'Authorization': `Bearer ${process.env.APPILIX_API_KEY}`
     //   },
     //   body: JSON.stringify({ user_identity, title, message, open_link_url })
     // });
     // const text = await r.text();
 
-    // Stub (until real API wired):
+    // For now stub (always “false” so FCM fallback triggers):
     const text = JSON.stringify({ status: "false", msg: "User identity is not found." });
 
     return { statusCode: 200, headers, body: JSON.stringify({ ok:true, result:{ status:200, text }}) };

@@ -1,12 +1,10 @@
 // netlify/functions/send-appilix-push.js
-
 const ALLOWED_ORIGINS = new Set([
   'https://bechobazaar.com',
   'https://www.bechobazaar.com',
   'http://localhost:3000',
   'http://localhost:5173',
 ]);
-
 function corsHeaders(origin) {
   const allow = ALLOWED_ORIGINS.has(origin) ? origin : 'https://bechobazaar.com';
   return {
@@ -14,6 +12,7 @@ function corsHeaders(origin) {
     'Vary': 'Origin',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Max-Age': '86400',
   };
 }
 
@@ -22,7 +21,7 @@ exports.handler = async (event) => {
   const headers = corsHeaders(origin);
 
   if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 200, headers, body: 'OK' };
+    return { statusCode: 204, headers, body: '' };
   }
   if (event.httpMethod !== 'POST') {
     return { statusCode: 405, headers, body: 'Method Not Allowed' };
@@ -31,14 +30,21 @@ exports.handler = async (event) => {
   try {
     const { user_identity, title, message, open_link_url } = JSON.parse(event.body || '{}');
 
-    // TODO: yahan aap Appilix API ko call karte ho
-    // const resp = await fetch(APPILIX_URL, { ... });
+    // TODO: Call Appilix API here (this is a passthrough stub)
+    // const r = await fetch(APPILIX_URL, {method:'POST', headers:{...}, body: JSON.stringify({...})});
+    // const text = await r.text();
 
-    // For now just echo (aapka actual logic yahan rahe)
+    // Since web bridge usually missing, Appilix will often respond "status:false"
     return {
       statusCode: 200,
       headers,
-      body: JSON.stringify({ ok: true, result: { status: 200, text: '{"status":"false","msg":"User identity is not found."}' } })
+      body: JSON.stringify({
+        ok: true,
+        result: {
+          status: 200,
+          text: JSON.stringify({ status: "false", msg: "User identity is not found." })
+        }
+      })
     };
   } catch (e) {
     return { statusCode: 500, headers, body: JSON.stringify({ ok:false, error:String(e?.message||e) }) };

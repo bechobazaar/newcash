@@ -1,38 +1,46 @@
 // netlify/functions/send-appilix-push.js
-export async function handler(event) {
-  const cors = {
-    'Access-Control-Allow-Origin': event.headers.origin || 'https://bechobazaar.com',
+
+const ALLOWED_ORIGINS = new Set([
+  'https://bechobazaar.com',
+  'https://www.bechobazaar.com',
+  'http://localhost:3000',
+  'http://localhost:5173',
+]);
+
+function corsHeaders(origin) {
+  const allow = ALLOWED_ORIGINS.has(origin) ? origin : 'https://bechobazaar.com';
+  return {
+    'Access-Control-Allow-Origin': allow,
+    'Vary': 'Origin',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS'
   };
-  if (event.httpMethod === 'OPTIONS') return { statusCode:204, headers:cors, body:'' };
+}
+
+exports.handler = async (event) => {
+  const origin = event.headers?.origin || '';
+  const headers = corsHeaders(origin);
+
+  if (event.httpMethod === 'OPTIONS') {
+    return { statusCode: 200, headers, body: 'OK' };
+  }
+  if (event.httpMethod !== 'POST') {
+    return { statusCode: 405, headers, body: 'Method Not Allowed' };
+  }
 
   try {
     const { user_identity, title, message, open_link_url } = JSON.parse(event.body || '{}');
 
-    const appKey = process.env.APPILIX_APP_KEY;
-    const apiKey = process.env.APPILIX_API_KEY;
-    if (!appKey || !apiKey) {
-      return { statusCode:500, headers:cors, body: JSON.stringify({ ok:false, error:'Missing Appilix keys' }) };
-    }
+    // TODO: yahan aap Appilix API ko call karte ho
+    // const resp = await fetch(APPILIX_URL, { ... });
 
-    const form = new URLSearchParams();
-    form.set('app_key', appKey);
-    form.set('api_key', apiKey);
-    form.set('notification_title', title || 'Notification');
-    form.set('notification_body', message || '');
-    if (user_identity) form.set('user_identity', user_identity);   // targeted
-    if (open_link_url) form.set('open_link_url', open_link_url);
-
-    const resp = await fetch('https://appilix.com/api/push-notification', {
-      method:'POST',
-      headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
-      body: form.toString()
-    });
-
-    const text = await resp.text(); // e.g. {"status":"true"} or {"status":"false", "msg":"User identity is not found."}
-    return { statusCode:200, headers:cors, body: JSON.stringify({ ok:true, result:{ status: resp.status, text } }) };
-  } catch (err) {
-    return { statusCode:500, headers:cors, body: JSON.stringify({ ok:false, error:String(err?.message||err) }) };
+    // For now just echo (aapka actual logic yahan rahe)
+    return {
+      statusCode: 200,
+      headers,
+      body: JSON.stringify({ ok: true, result: { status: 200, text: '{"status":"false","msg":"User identity is not found."}' } })
+    };
+  } catch (e) {
+    return { statusCode: 500, headers, body: JSON.stringify({ ok:false, error:String(e?.message||e) }) };
   }
-}
+};

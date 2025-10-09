@@ -1,5 +1,5 @@
 // netlify/functions/get-messages.js
-// Client sends ?email=...&password=... ; we fetch JWT and list messages (text + html).
+// Client sends ?email=...&password=... ; we fetch JWT and list messages.
 const API = 'https://api.mail.tm';
 const cors = () => ({
   "Access-Control-Allow-Origin": "*",
@@ -37,27 +37,21 @@ exports.handler = async (event) => {
     if(!token) throw new Error('no token from mail.tm');
     const auth = { Authorization: `Bearer ${token}` };
 
-    // 2) list
+    // 2) list messages
     const list = await json('GET', `${API}/messages`, null, auth);
     const items = (list && list['hydra:member']) ? list['hydra:member'] : [];
 
-    // 3) expand (include text + html)
+    // 3) expand each message for text body
     const full = await Promise.all(items.map(async (m) => {
       try {
         const one = await json('GET', `${API}/messages/${m.id}`, null, auth);
         const text = one.text || (Array.isArray(one.text) ? one.text.join('\n') : '') || '';
-        let htmlBody = '';
-        if (one.html) {
-          if (typeof one.html === 'string') htmlBody = one.html;
-          else if (Array.isArray(one.html)) htmlBody = one.html.join('\n');
-        }
         return {
           id: one.id,
           from: (one.from && one.from.address) || (one.from && one.from.name) || '',
           subject: one.subject || '(no subject)',
           date: one.createdAt || new Date().toISOString(),
-          textBody: text,
-          htmlBody
+          textBody: text
         };
       } catch {
         return {
@@ -65,8 +59,7 @@ exports.handler = async (event) => {
           from: (m.from && m.from.address) || '',
           subject: m.subject || '(no subject)',
           date: m.createdAt || '',
-          textBody: '',
-          htmlBody: ''
+          textBody: ''
         };
       }
     }));
@@ -74,6 +67,7 @@ exports.handler = async (event) => {
     full.sort((a,b)=> new Date(b.date) - new Date(a.date));
     return { statusCode: 200, headers: cors(), body: JSON.stringify(full) };
   } catch (e) {
+    // If creds expired/invalid, return empty array instead of hard error for smoother UX
     if (String(e.message).includes('401') || String(e.message).includes('404')) {
       return { statusCode: 200, headers: cors(), body: JSON.stringify([]) };
     }

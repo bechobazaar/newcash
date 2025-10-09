@@ -1,14 +1,11 @@
 // netlify/functions/notify-on-new-message.js
-
-// --- allow your web origins here ---
+// CORS allow-list
 const ALLOWED_ORIGINS = new Set([
   'https://bechobazaar.com',
   'https://www.bechobazaar.com',
-  // local dev origins (optional):
   'http://localhost:3000',
   'http://localhost:5173',
 ]);
-
 function corsHeaders(origin) {
   const allow = ALLOWED_ORIGINS.has(origin) ? origin : 'https://bechobazaar.com';
   return {
@@ -19,67 +16,109 @@ function corsHeaders(origin) {
   };
 }
 
-exports.handler = async (event, context) => {
+// ---- Firebase Admin init (Netlify envs recommended) ----
+const admin = require('firebase-admin');
+
+if (!admin.apps.length) {
+  // Prefer GOOGLE_APPLICATION_CREDENTIALS (JSON) in Netlify env, else use individual env vars
+  try {
+    // If you store the full service account JSON in env var FIREBASE_SERVICE_ACCOUNT
+    const svcJson = process.env.FIREBASE_SERVICE_ACCOUNT;
+    if (svcJson) {
+      admin.initializeApp({
+        credential: admin.credential.cert(JSON.parse(svcJson)),
+      });
+    } else {
+      // Or default creds (works if GOOGLE_APPLICATION_CREDENTIALS is set)
+      admin.initializeApp();
+    }
+  } catch (e) {
+    console.error('Admin init error', e);
+    throw e;
+  }
+}
+
+const db = admin.firestore();
+
+exports.handler = async (event) => {
   const origin = event.headers?.origin || '';
   const headers = corsHeaders(origin);
 
-  // --- CORS preflight ---
+  // Preflight
   if (event.httpMethod === 'OPTIONS') {
     return { statusCode: 200, headers, body: 'OK' };
   }
-
   if (event.httpMethod !== 'POST') {
     return { statusCode: 405, headers, body: 'Method Not Allowed' };
   }
 
   try {
-    // ---- Auth (idToken from browser) ----
+    // ----- Auth: verify idToken from browser -----
     const authz = event.headers?.authorization || '';
     if (!/^Bearer\s.+/.test(authz)) {
       return { statusCode: 401, headers, body: 'Missing Authorization' };
     }
     const idToken = authz.replace(/^Bearer\s+/, '');
+    let senderUid;
+    try {
+      const decoded = await admin.auth().verifyIdToken(idToken);
+      senderUid = decoded.uid;
+    } catch (e) {
+      return { statusCode: 401, headers, body: 'Invalid token' };
+    }
 
-    // TODO: Verify with Firebase Admin
-    // const admin = require('firebase-admin');
-    // if (!admin.apps.length) admin.initializeApp();
-    // const decoded = await admin.auth().verifyIdToken(idToken);
-
-    const body = JSON.parse(event.body || '{}');
-    const { chatId, messageId } = body;
+    const { chatId, messageId, previewText } = JSON.parse(event.body || '{}');
     if (!chatId || !messageId) {
       return { statusCode: 400, headers, body: 'chatId & messageId required' };
     }
 
-    // TODO: Lookup recipient UID(s) by chatId
-    // const chatDoc = await admin.firestore().doc(`chats/${chatId}`).get();
-    // const users = chatDoc.data().users || [];
-    // const recipient = users.find(u => u !== decoded.uid);
+    // ----- Resolve recipient from chat -----
+    const chatDoc = await db.collection('chats').doc(chatId).get();
+    if (!chatDoc.exists) {
+      return { statusCode: 404, headers, body: 'Chat not found' };
+    }
+    const users = Array.isArray(chatDoc.data().users) ? chatDoc.data().users : [];
+    const recipientUid = users.find(u => u !== senderUid);
+    if (!recipientUid) {
+      return { statusCode: 400, headers, body: 'Recipient not found' };
+    }
 
-    // TODO: Read users/{recipient}/fcmTokens/*
-    // const tokensSnap = await admin.firestore()
-    //   .collection('users').doc(recipient).collection('fcmTokens').get();
-    // const tokens = tokensSnap.docs.map(d => d.id || d.data().token).filter(Boolean);
+    // ----- Collect FCM tokens from users/{uid}/fcmTokens -----
+    const tokensSnap = await db.collection('users').doc(recipientUid).collection('fcmTokens').get();
+    const tokens = [];
+    tokensSnap.forEach(d => {
+      const tok = d.id || d.data()?.token;
+      if (tok) tokens.push(tok);
+    });
+    if (!tokens.length) {
+      // No tokens — nothing to send
+      return { statusCode: 200, headers, body: JSON.stringify({ ok: true, sent: 0, reason: 'no-tokens' }) };
+    }
 
-    // TODO: Send FCM
-    // if (tokens.length) {
-    //   await admin.messaging().sendMulticast({
-    //     tokens,
-    //     notification: { title: 'New message', body: 'You have a new message' },
-    //     data: { chatId, messageId, open_link_url: `https://bechobazaar.com/chat-list?open_conversation=${chatId}` },
-    //   });
-    // }
+    // ----- Compose data payload for your SW handler -----
+    const openUrl = `https://bechobazaar.com/chat-list?open_conversation=${encodeURIComponent(chatId)}`;
+    const title   = 'New message';
+    const body    = (previewText && String(previewText).trim()) || 'New message received';
 
-    return {
-      statusCode: 200,
-      headers,
-      body: JSON.stringify({ ok: true }),
+    // Use data payload (works with firebase-messaging-sw.js setBackgroundMessageHandler)
+    const message = {
+      tokens,
+      data: {
+        title,
+        body,
+        chatId,
+        messageId,
+        open_link_url: openUrl,
+        // optional extras:
+        click_action: openUrl,
+      },
+      // (optional) webpush headers if you like richer behavior
+      webpush: {
+        fcm_options: { link: openUrl },
+        headers: {
+          Urgency: 'high',
+        },
+      },
     };
-  } catch (e) {
-    return {
-      statusCode: 500,
-      headers,
-      body: JSON.stringify({ ok: false, error: String(e?.message || e) }),
-    };
-  }
-};
+
+    const resp = await admin.messaging().sendEachForMulticast(mess

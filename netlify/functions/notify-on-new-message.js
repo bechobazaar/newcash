@@ -14,6 +14,7 @@ function corsHeaders(origin) {
     'Vary': 'Origin',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Max-Age': '86400',
   };
 }
 
@@ -35,26 +36,29 @@ if (!admin.apps.length) {
   const svc = getServiceAccountFromEnv();
   admin.initializeApp({
     credential: admin.credential.cert(svc),
-    projectId: svc.project_id || 'olxhub-12479',
+    projectId: svc.project_id || 'olxhub-12479', // safety
   });
+  // helpful once in logs to ensure project matches client
+  console.log('Admin project:', admin.app().options.projectId);
 }
+
 const db = admin.firestore();
 
 // ---------- Handler ----------
 exports.handler = async (event) => {
-  const origin = event.headers?.origin || '';
+  const origin  = event.headers?.origin || '';
   const headers = corsHeaders(origin);
 
-  // Preflight
+  // Preflight: must always return CORS headers
   if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 200, headers, body: 'OK' };
+    return { statusCode: 204, headers, body: '' };
   }
   if (event.httpMethod !== 'POST') {
     return { statusCode: 405, headers, body: 'Method Not Allowed' };
   }
 
   try {
-    // Auth (idToken from browser)
+    // 1) Verify idToken from browser
     const authz = event.headers?.authorization || '';
     if (!/^Bearer\s.+/.test(authz)) {
       return { statusCode: 401, headers, body: 'Missing Authorization' };
@@ -70,125 +74,75 @@ exports.handler = async (event) => {
     }
     const senderUid = decoded.uid;
 
-    // Body
+    // 2) Parse input
     const { chatId, messageId, previewText } = JSON.parse(event.body || '{}');
     if (!chatId || !messageId) {
       return { statusCode: 400, headers, body: 'chatId & messageId required' };
     }
 
-    // Resolve recipient from chat doc
+    // 3) Resolve recipient from chat
     const chatDoc = await db.collection('chats').doc(chatId).get();
     if (!chatDoc.exists) {
       return { statusCode: 404, headers, body: 'Chat not found' };
     }
     const users = Array.isArray(chatDoc.data().users) ? chatDoc.data().users : [];
-    const recipientUid = users.find((u) => u !== senderUid);
+    const recipientUid = users.find(u => u !== senderUid);
     if (!recipientUid) {
       return { statusCode: 400, headers, body: 'Recipient not found' };
     }
 
-    // Collect FCM tokens (users/{uid}/fcmTokens)
-    const tokensSnap = await db
-      .collection('users')
-      .doc(recipientUid)
-      .collection('fcmTokens')
-      .get();
-
+    // 4) Collect tokens
+    const tokensSnap = await db.collection('users').doc(recipientUid).collection('fcmTokens').get();
     const tokens = [];
-    tokensSnap.forEach((d) => {
+    tokensSnap.forEach(d => {
       const tok = d.id || d.data()?.token;
       if (tok) tokens.push(tok);
     });
-
     if (!tokens.length) {
       return {
         statusCode: 200,
         headers,
-        body: JSON.stringify({ ok: true, sent: 0, reason: 'no-tokens' }),
+        body: JSON.stringify({ ok: true, sent: 0, fail: 0, reason: 'no-tokens' }),
       };
     }
 
-    // Compose data payload (your SW reads data.title/body/open_link_url)
-    const openUrl = `https://bechobazaar.com/chat-list?open_conversation=${encodeURIComponent(
-      chatId
-    )}`;
-    const title = 'New message';
-    const bodyTxt = (previewText && String(previewText).trim()) || 'New message received';
-
+    // 5) Compose payload (data-only; your SW reads data.title/body/open_link_url)
+    const openUrl = `https://bechobazaar.com/chat-list?open_conversation=${encodeURIComponent(chatId)}`;
     const multicast = {
       tokens,
       data: {
-        title: title,
-        body: bodyTxt,
+        title: 'New message',
+        body: (previewText && String(previewText).trim()) || 'New message received',
         chatId,
         messageId,
         open_link_url: openUrl,
         click_action: openUrl,
       },
-      webpush: {
-        fcm_options: { link: openUrl },
-        headers: { Urgency: 'high' },
-      },
+      webpush: { fcm_options: { link: openUrl }, headers: { Urgency: 'high' } },
     };
 
-   const resp = await admin.messaging().sendEachForMulticast(multicast);
+    // 6) Send
+    const resp = await admin.messaging().sendEachForMulticast(multicast);
 
-// --- DEBUG: collect error details (TEMPORARY but very useful) ---
-const errors = [];
-resp.responses.forEach((r, i) => {
-  if (!r.success) {
-    errors.push({
-      token: tokens[i],
-      code:  r.error?.code || null,
-      msg:   r.error?.message || null,
+    // 7) Collect error details (for debugging UI)
+    const errors = [];
+    resp.responses.forEach((r, i) => {
+      if (!r.success) {
+        errors.push({
+          token: tokens[i],
+          code:  r.error?.code || null,
+          msg:   r.error?.message || null,
+        });
+      }
     });
-  }
-});
 
-// Cleanup invalid tokens (keep as-is)
-const bad = [];
-resp.responses.forEach((r, i) => {
-  if (!r.success) {
-    const code = r.error?.code || '';
-    if (code === 'messaging/registration-token-not-registered' ||
-        code === 'messaging/invalid-registration-token') {
-      bad.push(tokens[i]);
-    }
-  }
-});
-if (bad.length) {
-  const batch = db.batch();
-  bad.forEach((tk) =>
-    batch.delete(db.collection('users').doc(recipientUid).collection('fcmTokens').doc(tk))
-  );
-  await batch.commit().catch(()=>{});
-}
-
-// Optional delivered mark (keep)
-/* ... */
-
-return {
-  statusCode: 200,
-  headers,
-  body: JSON.stringify({
-    ok: true,
-    sent: resp.successCount || 0,
-    fail: resp.failureCount || 0,
-    errors, // 👈 add this
-  }),
-};
-
-
-
-    // Cleanup invalid tokens
+    // 8) Cleanup invalid tokens
     const bad = [];
     resp.responses.forEach((r, i) => {
       if (!r.success) {
         const code = r.error?.code || '';
-        if (
-          code === 'messaging/registration-token-not-registered' ||
-          code === 'messaging/invalid-registration-token'
-        ) {
+        if (code === 'messaging/registration-token-not-registered' ||
+            code === 'messaging/invalid-registration-token') {
           bad.push(tokens[i]);
         }
       }
@@ -198,16 +152,12 @@ return {
       bad.forEach((tk) =>
         batch.delete(db.collection('users').doc(recipientUid).collection('fcmTokens').doc(tk))
       );
-      await batch.commit().catch(() => {});
+      await batch.commit().catch(()=>{});
     }
 
-    // Optional: quick delivered mark
+    // 9) Optional: optimistic delivered
     try {
-      await db
-        .collection('chats')
-        .doc(chatId)
-        .collection('messages')
-        .doc(messageId)
+      await db.collection('chats').doc(chatId).collection('messages').doc(messageId)
         .set({ delivered: true }, { merge: true });
     } catch (_) {}
 
@@ -218,6 +168,7 @@ return {
         ok: true,
         sent: resp.successCount || 0,
         fail: resp.failureCount || 0,
+        errors, // keep for now; remove later if you want
       }),
     };
   } catch (e) {

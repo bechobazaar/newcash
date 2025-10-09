@@ -133,6 +133,27 @@ exports.handler = async (event) => {
 
     const resp = await admin.messaging().sendEachForMulticast(multicast);
 
+    const errors = [];
+resp.responses.forEach((r,i) => {
+  if (!r.success) errors.push({
+    token: tokens[i],
+    code:  r.error?.code || null,
+    msg:   r.error?.message || null,
+  });
+});
+
+return {
+  statusCode: 200,
+  headers,
+  body: JSON.stringify({
+    ok: true,
+    sent: resp.successCount || 0,
+    fail: resp.failureCount || 0,
+    errors,                     // 👈 add this
+  }),
+};
+
+
     // Cleanup invalid tokens
     const bad = [];
     resp.responses.forEach((r, i) => {

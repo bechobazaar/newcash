@@ -1,64 +1,85 @@
-// (B) Chat message -> notify only the receiver (Appilix direct)
-// Body: { chatId, messageId, receiverUid, preview, open }
-import { initializeApp, cert } from "firebase-admin/app";
-import { getFirestore } from "firebase-admin/firestore";
+// netlify/functions/notify-on-new-message.js
 
-let app;
-function init() {
-  if (!app) {
-    const { FIREBASE_SERVICE_ACCOUNT_B64, FIREBASE_PROJECT_ID } = process.env;
-    if (!FIREBASE_SERVICE_ACCOUNT_B64 || !FIREBASE_PROJECT_ID) throw new Error("Missing Firebase env");
-    const json = JSON.parse(Buffer.from(FIREBASE_SERVICE_ACCOUNT_B64, "base64").toString("utf8"));
-    app = initializeApp({ credential: cert(json), projectId: FIREBASE_PROJECT_ID });
-  }
-  return getFirestore();
+// --- allow your web origins here ---
+const ALLOWED_ORIGINS = new Set([
+  'https://bechobazaar.com',
+  'https://www.bechobazaar.com',
+  // local dev origins (optional):
+  'http://localhost:3000',
+  'http://localhost:5173',
+]);
+
+function corsHeaders(origin) {
+  const allow = ALLOWED_ORIGINS.has(origin) ? origin : 'https://bechobazaar.com';
+  return {
+    'Access-Control-Allow-Origin': allow,
+    'Vary': 'Origin',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  };
 }
 
-const directEndpoint = "/.netlify/functions/send-appilix-direct";
+exports.handler = async (event, context) => {
+  const origin = event.headers?.origin || '';
+  const headers = corsHeaders(origin);
 
-export const handler = async (event, ctx) => {
+  // --- CORS preflight ---
+  if (event.httpMethod === 'OPTIONS') {
+    return { statusCode: 200, headers, body: 'OK' };
+  }
+
+  if (event.httpMethod !== 'POST') {
+    return { statusCode: 405, headers, body: 'Method Not Allowed' };
+  }
+
   try {
-    const db = init();
+    // ---- Auth (idToken from browser) ----
+    const authz = event.headers?.authorization || '';
+    if (!/^Bearer\s.+/.test(authz)) {
+      return { statusCode: 401, headers, body: 'Missing Authorization' };
+    }
+    const idToken = authz.replace(/^Bearer\s+/, '');
 
-    if (event.httpMethod === "OPTIONS") {
-      return {
-        statusCode: 204,
-        headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "Content-Type,Authorization" },
-      };
+    // TODO: Verify with Firebase Admin
+    // const admin = require('firebase-admin');
+    // if (!admin.apps.length) admin.initializeApp();
+    // const decoded = await admin.auth().verifyIdToken(idToken);
+
+    const body = JSON.parse(event.body || '{}');
+    const { chatId, messageId } = body;
+    if (!chatId || !messageId) {
+      return { statusCode: 400, headers, body: 'chatId & messageId required' };
     }
 
-    const { chatId, messageId, receiverUid, preview, open } = JSON.parse(event.body || "{}");
-    if (!chatId || !messageId || !receiverUid) {
-      return { statusCode: 400, body: "chatId, messageId, receiverUid required" };
-    }
+    // TODO: Lookup recipient UID(s) by chatId
+    // const chatDoc = await admin.firestore().doc(`chats/${chatId}`).get();
+    // const users = chatDoc.data().users || [];
+    // const recipient = users.find(u => u !== decoded.uid);
 
-    // (Optional) sanity: confirm message & chat exist
-    const chatRef = db.collection("chats").doc(chatId);
-    const msgRef = chatRef.collection("messages").doc(messageId);
-    const [chatSnap, msgSnap] = await Promise.all([chatRef.get(), msgRef.get()]);
-    if (!chatSnap.exists || !msgSnap.exists) {
-      return { statusCode: 404, body: "chat/message not found" };
-    }
+    // TODO: Read users/{recipient}/fcmTokens/*
+    // const tokensSnap = await admin.firestore()
+    //   .collection('users').doc(recipient).collection('fcmTokens').get();
+    // const tokens = tokensSnap.docs.map(d => d.id || d.data().token).filter(Boolean);
 
-    // Build title/body/link
-    const title = "New message";
-    const body = (preview && String(preview).slice(0, 90)) || "You received a new message";
-    const open_link_url =
-      open ||
-      `https://bechobazaar.com/chat-list?open_conversation=${encodeURIComponent(chatId)}&m=${encodeURIComponent(
-        messageId
-      )}`;
+    // TODO: Send FCM
+    // if (tokens.length) {
+    //   await admin.messaging().sendMulticast({
+    //     tokens,
+    //     notification: { title: 'New message', body: 'You have a new message' },
+    //     data: { chatId, messageId, open_link_url: `https://bechobazaar.com/chat-list?open_conversation=${chatId}` },
+    //   });
+    // }
 
-    // Call local direct function (keeps single code path for Appilix)
-    const res = await fetch(directEndpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title, body, user_identity: receiverUid, open_link_url }),
-    });
-
-    const text = await res.text();
-    return { statusCode: 200, body: text };
+    return {
+      statusCode: 200,
+      headers,
+      body: JSON.stringify({ ok: true }),
+    };
   } catch (e) {
-    return { statusCode: 500, body: e.message };
+    return {
+      statusCode: 500,
+      headers,
+      body: JSON.stringify({ ok: false, error: String(e?.message || e) }),
+    };
   }
 };

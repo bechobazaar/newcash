@@ -131,16 +131,41 @@ exports.handler = async (event) => {
       },
     };
 
-    const resp = await admin.messaging().sendEachForMulticast(multicast);
+   const resp = await admin.messaging().sendEachForMulticast(multicast);
 
-    const errors = [];
-resp.responses.forEach((r,i) => {
-  if (!r.success) errors.push({
-    token: tokens[i],
-    code:  r.error?.code || null,
-    msg:   r.error?.message || null,
-  });
+// --- DEBUG: collect error details (TEMPORARY but very useful) ---
+const errors = [];
+resp.responses.forEach((r, i) => {
+  if (!r.success) {
+    errors.push({
+      token: tokens[i],
+      code:  r.error?.code || null,
+      msg:   r.error?.message || null,
+    });
+  }
 });
+
+// Cleanup invalid tokens (keep as-is)
+const bad = [];
+resp.responses.forEach((r, i) => {
+  if (!r.success) {
+    const code = r.error?.code || '';
+    if (code === 'messaging/registration-token-not-registered' ||
+        code === 'messaging/invalid-registration-token') {
+      bad.push(tokens[i]);
+    }
+  }
+});
+if (bad.length) {
+  const batch = db.batch();
+  bad.forEach((tk) =>
+    batch.delete(db.collection('users').doc(recipientUid).collection('fcmTokens').doc(tk))
+  );
+  await batch.commit().catch(()=>{});
+}
+
+// Optional delivered mark (keep)
+/* ... */
 
 return {
   statusCode: 200,
@@ -149,9 +174,10 @@ return {
     ok: true,
     sent: resp.successCount || 0,
     fail: resp.failureCount || 0,
-    errors,                     // 👈 add this
+    errors, // 👈 add this
   }),
 };
+
 
 
     // Cleanup invalid tokens

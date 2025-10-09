@@ -23,23 +23,6 @@
     Cache-Control = "no-store"
 
 
-    [[headers]]
-  for = "/.netlify/functions/*"
-  [headers.values]
-    Access-Control-Allow-Origin = "https://bechobazaar.com"
-    Access-Control-Allow-Methods = "POST, OPTIONS"
-    Access-Control-Allow-Headers = "Content-Type, Authorization"
-    Access-Control-Max-Age = "86400"
-
-[[headers]]
-  for = "/.netlify/functions/*"
-  [headers.values]
-    Access-Control-Allow-Origin = "https://www.bechobazaar.com"
-    Access-Control-Allow-Methods = "POST, OPTIONS"
-    Access-Control-Allow-Headers = "Content-Type, Authorization"
-    Access-Control-Max-Age = "86400"
-
-
 # SW file should bypass SPA rewrites
 [[redirects]]
   from = "/firebase-messaging-sw.js"
@@ -77,6 +60,7 @@
 # (optional) keep only if you actually have this function file
 [functions."auto-bump"]
   schedule = "*/10 * * * *"
+
 
 
 

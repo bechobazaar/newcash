@@ -25,7 +25,7 @@ function getServiceAccountFromEnv() {
   const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_B64;
   if (!b64) throw new Error('FIREBASE_SERVICE_ACCOUNT_B64 not set');
   const json = Buffer.from(b64, 'base64').toString('utf8');
-  const svc = JSON.parse(json);
+  const svc  = JSON.parse(json);
   if (svc.private_key && svc.private_key.includes('\\n')) {
     svc.private_key = svc.private_key.replace(/\\n/g, '\n');
   }
@@ -36,9 +36,8 @@ if (!admin.apps.length) {
   const svc = getServiceAccountFromEnv();
   admin.initializeApp({
     credential: admin.credential.cert(svc),
-    projectId: svc.project_id || 'olxhub-12479', // safety
+    projectId: svc.project_id || 'olxhub-12479',
   });
-  // helpful once in logs to ensure project matches client
   console.log('Admin project:', admin.app().options.projectId);
 }
 
@@ -49,7 +48,7 @@ exports.handler = async (event) => {
   const origin  = event.headers?.origin || '';
   const headers = corsHeaders(origin);
 
-  // Preflight: must always return CORS headers
+  // Preflight
   if (event.httpMethod === 'OPTIONS') {
     return { statusCode: 204, headers, body: '' };
   }
@@ -58,7 +57,7 @@ exports.handler = async (event) => {
   }
 
   try {
-    // 1) Verify idToken from browser
+    // 1) Verify idToken
     const authz = event.headers?.authorization || '';
     if (!/^Bearer\s.+/.test(authz)) {
       return { statusCode: 401, headers, body: 'Missing Authorization' };
@@ -74,39 +73,31 @@ exports.handler = async (event) => {
     }
     const senderUid = decoded.uid;
 
-    // 2) Parse input
+    // 2) Parse
     const { chatId, messageId, previewText } = JSON.parse(event.body || '{}');
     if (!chatId || !messageId) {
       return { statusCode: 400, headers, body: 'chatId & messageId required' };
     }
 
-    // 3) Resolve recipient from chat
+    // 3) Recipient resolve
     const chatDoc = await db.collection('chats').doc(chatId).get();
-    if (!chatDoc.exists) {
-      return { statusCode: 404, headers, body: 'Chat not found' };
-    }
+    if (!chatDoc.exists) return { statusCode: 404, headers, body: 'Chat not found' };
     const users = Array.isArray(chatDoc.data().users) ? chatDoc.data().users : [];
     const recipientUid = users.find(u => u !== senderUid);
-    if (!recipientUid) {
-      return { statusCode: 400, headers, body: 'Recipient not found' };
-    }
+    if (!recipientUid) return { statusCode: 400, headers, body: 'Recipient not found' };
 
-    // 4) Collect tokens
-    const tokensSnap = await db.collection('users').doc(recipientUid).collection('fcmTokens').get();
+    // 4) Tokens
+    const snap = await db.collection('users').doc(recipientUid).collection('fcmTokens').get();
     const tokens = [];
-    tokensSnap.forEach(d => {
+    snap.forEach(d => {
       const tok = d.id || d.data()?.token;
       if (tok) tokens.push(tok);
     });
     if (!tokens.length) {
-      return {
-        statusCode: 200,
-        headers,
-        body: JSON.stringify({ ok: true, sent: 0, fail: 0, reason: 'no-tokens' }),
-      };
+      return { statusCode: 200, headers, body: JSON.stringify({ ok:true, sent:0, fail:0, reason:'no-tokens' }) };
     }
 
-    // 5) Compose payload (data-only; your SW reads data.title/body/open_link_url)
+    // 5) Payload
     const openUrl = `https://bechobazaar.com/chat-list?open_conversation=${encodeURIComponent(chatId)}`;
     const multicast = {
       tokens,
@@ -118,13 +109,16 @@ exports.handler = async (event) => {
         open_link_url: openUrl,
         click_action: openUrl,
       },
-      webpush: { fcm_options: { link: openUrl }, headers: { Urgency: 'high' } },
+      webpush: {
+        fcm_options: { link: openUrl },
+        headers: { Urgency: 'high' },
+      },
     };
 
     // 6) Send
     const resp = await admin.messaging().sendEachForMulticast(multicast);
 
-    // 7) Collect error details (for debugging UI)
+    // 7) Errors (debug)
     const errors = [];
     resp.responses.forEach((r, i) => {
       if (!r.success) {
@@ -141,8 +135,11 @@ exports.handler = async (event) => {
     resp.responses.forEach((r, i) => {
       if (!r.success) {
         const code = r.error?.code || '';
-        if (code === 'messaging/registration-token-not-registered' ||
-            code === 'messaging/invalid-registration-token') {
+        if (
+          code === 'messaging/registration-token-not-registered' ||
+          code === 'messaging/invalid-registration-token' ||
+          code === 'messaging/third-party-auth-error' // Web Push auth mismatch → purge
+        ) {
           bad.push(tokens[i]);
         }
       }
@@ -155,28 +152,19 @@ exports.handler = async (event) => {
       await batch.commit().catch(()=>{});
     }
 
-    // 9) Optional: optimistic delivered
+    // 9) Optional: mark delivered
     try {
       await db.collection('chats').doc(chatId).collection('messages').doc(messageId)
         .set({ delivered: true }, { merge: true });
-    } catch (_) {}
+    } catch(_) {}
 
     return {
       statusCode: 200,
       headers,
-      body: JSON.stringify({
-        ok: true,
-        sent: resp.successCount || 0,
-        fail: resp.failureCount || 0,
-        errors, // keep for now; remove later if you want
-      }),
+      body: JSON.stringify({ ok:true, sent: resp.successCount||0, fail: resp.failureCount||0, errors }),
     };
   } catch (e) {
     console.error('notify-on-new-message error:', e);
-    return {
-      statusCode: 500,
-      headers,
-      body: JSON.stringify({ ok: false, error: String(e?.message || e) }),
-    };
+    return { statusCode: 500, headers, body: JSON.stringify({ ok:false, error: String(e?.message||e) }) };
   }
 };

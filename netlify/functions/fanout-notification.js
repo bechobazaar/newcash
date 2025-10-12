@@ -2,23 +2,102 @@
 import { getAdmin, corsHeaders, corsPreflight } from "./_admin.js";
 
 const SITE_ORIGIN = "https://bechobazaar.com";
-
-// Appilix proxy (aapka pehle se hai)
+// Appilix proxy (already deployed)
 const APPILIX_PROXY = "/.netlify/functions/send-appilix-push";
+
+// --- helper: absolute URL from relative ---
+function toAbsUrl(pathOrUrl) {
+  const open = (pathOrUrl || "/notifications") + "";
+  return open.startsWith("http")
+    ? open
+    : (SITE_ORIGIN + (open.startsWith("/") ? open : ("/" + open)));
+}
+
+// --- helper: Appilix-only push (no Firestore/FCM needed) ---
+async function appilixOnlyPush({ userId, title, body, imageUrl, open }) {
+  if (!userId) throw new Error("userId required for Appilix-only path");
+  const openAbs = toAbsUrl(open);
+
+  const res = await fetch(APPILIX_PROXY, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      user_identity: userId,
+      title: title || "BechoBazaar",
+      message: body  || "You have a new notification",
+      image_url: imageUrl || "",
+      open_link_url: openAbs
+    })
+  });
+
+  const ok = res.ok;
+  return { ok, appilix: ok ? "sent" : "failed" };
+}
 
 export async function handler(event) {
   const pre = corsPreflight(event);
   if (pre) return pre;
 
   if (event.httpMethod !== "POST") {
-    return { statusCode: 405, headers: corsHeaders(event.headers.origin || "*"), body: "Method not allowed" };
+    return {
+      statusCode: 405,
+      headers: corsHeaders(event.headers.origin || "*"),
+      body: "Method not allowed"
+    };
   }
 
   try {
-    const { admin, db } = getAdmin();
     const req = JSON.parse(event.body || "{}");
 
-    // 1) Notification doc load / create
+    // ===== FAST PATH: if FIREBASE_SERVICE_ACCOUNT is missing/invalid, do Appilix-only =====
+    if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
+      const out = await appilixOnlyPush({
+        userId: req.userId,
+        title: req.title,
+        body:  req.body,
+        imageUrl: req.imageUrl,
+        open:  req.open
+      });
+      if (!out.ok) {
+        return {
+          statusCode: 500,
+          headers: corsHeaders(event.headers.origin || "*"),
+          body: JSON.stringify({ ok:false, error:"FIREBASE_SERVICE_ACCOUNT env missing; Appilix-only push failed" })
+        };
+      }
+      return {
+        statusCode: 200,
+        headers: corsHeaders(event.headers.origin || "*"),
+        body: JSON.stringify({ ok:true, fcm:"skipped (no env)", ...out })
+      };
+    }
+
+    // ===== NORMAL PATH: decode base64 SA via _admin.js → Firestore + FCM + Appilix =====
+    let admin, db;
+    try {
+      ({ admin, db } = getAdmin()); // _admin.js decodes BASE64 env & initializes firebase-admin
+    } catch (e) {
+      // If base64 invalid / JSON parse error: still fallback to Appilix-only
+      const out = await appilixOnlyPush({
+        userId: req.userId,
+        title: req.title,
+        body:  req.body,
+        imageUrl: req.imageUrl,
+        open:  req.open
+      });
+      return {
+        statusCode: out.ok ? 200 : 500,
+        headers: corsHeaders(event.headers.origin || "*"),
+        body: JSON.stringify({
+          ok: !!out.ok,
+          fcm: "skipped (env invalid)",
+          appilix: out.appilix,
+          hint: "Check FIREBASE_SERVICE_ACCOUNT base64 value"
+        })
+      };
+    }
+
+    // --- load or create notification doc ---
     let notifId = req.notifId || null;
     let notif = null;
 
@@ -42,26 +121,23 @@ export async function handler(event) {
       notif = { id: ref.id, ...doc };
     }
 
-    const uid = notif.userId;
-    if (!uid) throw new Error("userId missing on notification");
-
+    const uid   = notif.userId;
     const title = notif.title || "BechoBazaar";
     const text  = notif.body  || "You have a new notification";
-    const open  = (notif.open || "/notifications") + "";
-    const openAbs = open.startsWith("http") ? open : (SITE_ORIGIN + (open.startsWith("/") ? open : ("/"+open)));
     const image = notif.imageUrl || "";
+    const openAbs = toAbsUrl(notif.open);
 
-    // 2) Endpoints read
+    // --- read endpoints ---
     const userRef = db.collection("users").doc(uid);
     const [userSnap, fcmSnap] = await Promise.all([
       userRef.get(),
       userRef.collection("fcmTokens").get()
     ]);
 
-    const fcmTokens = fcmSnap.docs.map(d => (d.get("token") || "")).filter(Boolean);
+    const fcmTokens  = fcmSnap.docs.map(d => (d.get("token") || "")).filter(Boolean);
     const appilixIds = userSnap.exists ? Object.keys(userSnap.get("appilixIds") || {}) : [];
 
-    // 3) FCM push (web)
+    // --- FCM (web) ---
     let fcm = { sent: 0, failed: 0, pruned: 0 };
     if (fcmTokens.length) {
       const msg = {
@@ -77,14 +153,15 @@ export async function handler(event) {
           }
         }
       };
-      const resp = await getAdmin().admin.messaging().sendEachForMulticast(msg);
+      const resp = await (await getAdmin()).admin.messaging().sendEachForMulticast(msg);
       const toDelete = [];
       resp.responses.forEach((r, i) => {
         if (r.success) fcm.sent++;
         else {
           fcm.failed++;
           const code = r.error?.code || "";
-          if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
+          if (code === "messaging/registration-token-not-registered" ||
+              code === "messaging/invalid-registration-token") {
             toDelete.push(fcmTokens[i]);
           }
         }
@@ -97,25 +174,26 @@ export async function handler(event) {
       }
     }
 
-    // 4) Appilix push (native app)
+    // --- Appilix (native) ---
     let appilix = { sent: 0, failed: 0 };
     if (appilixIds.length) {
       const payload = {
-        user_identity: uid, // aap uid ko hi identity use kar rahe ho
-        title, message: text,
+        user_identity: uid, // you’re using uid as identity
+        title,
+        message: text,
         image_url: image || "",
         open_link_url: openAbs,
         data: { notifId }
       };
-      // Parallel: har identity pe ek call (proxy uid-identity pe map karta hai)
-      const promises = appilixIds.map(() =>
-        fetch(APPILIX_PROXY, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        })
+      const results = await Promise.allSettled(
+        appilixIds.map(() =>
+          fetch(APPILIX_PROXY, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          })
+        )
       );
-      const results = await Promise.allSettled(promises);
       for (const r of results) {
         if (r.status === "fulfilled" && r.value.ok) appilix.sent++;
         else appilix.failed++;
@@ -128,6 +206,10 @@ export async function handler(event) {
       body: JSON.stringify({ ok: true, notifId, fcm, appilix })
     };
   } catch (e) {
-    return { statusCode: 500, headers: corsHeaders(event.headers.origin || "*"), body: JSON.stringify({ ok:false, error:String(e.message||e) }) };
+    return {
+      statusCode: 500,
+      headers: corsHeaders(event.headers.origin || "*"),
+      body: JSON.stringify({ ok:false, error:String(e.message||e) })
+    };
   }
 }

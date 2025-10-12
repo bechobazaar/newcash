@@ -36,7 +36,7 @@ async function appilixOnlyPush(event, { userId, title, body, imageUrl, open }) {
     headers: { "Content-Type":"application/json" },
     body: JSON.stringify({
       user_identity: userId,
-      title:  title || "BechoBazaar",
+      title:  title || "Bechobazaar",
       message: body  || "You have a new notification",
       image_url: imageUrl || "",
       open_link_url: openAbs
@@ -112,7 +112,7 @@ export async function handler(event) {
       if (!req.userId) throw new Error("userId required");
       const doc = {
         userId:  req.userId,
-        title:   req.title   || "BechoBazaar",
+        title:   req.title   || "Bechobazaar",
         body:    req.body    || "",
         imageUrl:req.imageUrl|| "",
         open:    req.open    || "/notifications",
@@ -126,7 +126,7 @@ export async function handler(event) {
 
     // 2) Prepare payload bits
     const uid     = notif.userId;
-    const title   = notif.title || "BechoBazaar";
+    const title   = notif.title || "Bechobazaar";
     const text    = notif.body  || "You have a new notification";
     const image   = notif.imageUrl || "";
     const openAbs = toAbsUrl(notif.open);

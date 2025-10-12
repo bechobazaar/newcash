@@ -1,7 +1,7 @@
 // netlify/functions/fanout-notification.js
 import { getAdmin, corsHeaders, corsPreflight } from "./_admin.js";
 
-const SITE_ORIGIN = "https://Bechobazaar.com";
+const SITE_ORIGIN = "https://bechobazaar.com";
 
 // Build absolute site URL for server-side fetches
 function getBaseUrl(event) {
@@ -12,20 +12,20 @@ function getBaseUrl(event) {
   return `${proto}://${host}`;
 }
 
-// Always resolve path to absolute (default /account)
+// Absolute URL from relative (default /account)
 function toAbsUrl(pathOrUrl) {
-  const open = (pathOrUrl || "/account") + ""; // ← default account
+  const open = (pathOrUrl || "/account") + "";
   return open.startsWith("http")
     ? open
     : (SITE_ORIGIN + (open.startsWith("/") ? open : ("/" + open)));
 }
 
-// Appilix-only push (for fallback)
+// Appilix-only push (fallback when admin/env missing)
 async function appilixOnlyPush(event, { userId, title, body, imageUrl, open }) {
   if (!userId) throw new Error("userId required");
   const base = getBaseUrl(event);
   const url  = `${base}/.netlify/functions/send-appilix-push`;
-  const openAbs = toAbsUrl(open || "/account"); // force /account
+  const openAbs = toAbsUrl(open || "/account");
 
   const res = await fetch(url, {
     method: "POST",
@@ -52,14 +52,14 @@ export async function handler(event) {
   try {
     const req = JSON.parse(event.body || "{}");
 
-    // If no service account, fallback Appilix-only so UI not blocked
+    // Fallback when env missing: Appilix-only, enforce /account
     if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
       const out = await appilixOnlyPush(event, {
         userId:  req.userId,
         title:   req.title,
         body:    req.body,
         imageUrl:req.imageUrl,
-        open:    "/account" // enforce account
+        open:    "/account"
       });
       return {
         statusCode: out.ok ? 200 : 500,
@@ -68,7 +68,7 @@ export async function handler(event) {
       };
     }
 
-    // Initialize admin (base64 decode happens in _admin)
+    // Initialize admin (base64 decode inside _admin)
     const { admin, db } = getAdmin();
 
     // 1) Load/create notification
@@ -84,10 +84,10 @@ export async function handler(event) {
       if (!req.userId) throw new Error("userId required");
       const doc = {
         userId:  req.userId,
-        title:   req.title   || "Bechobazaar",
+        title:   req.title   || "Bechobazaar",  // keep incoming emoji title
         body:    req.body    || "",
         imageUrl:req.imageUrl|| "",
-        open:    "/account",         // ← enforce /account
+        open:    "/account",                    // force account
         seen: false,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       };
@@ -96,12 +96,12 @@ export async function handler(event) {
       notif = { id: ref.id, ...doc };
     }
 
-    // 2) Prepare payload
+    // 2) Prepare payload (preserve incoming title/body/image)
     const uid     = notif.userId;
-    const title   = notif.title || "Bechobazaar";
-    const text    = notif.body  || "You have a new notification";
-    const image   = notif.imageUrl || "";
-    const openAbs = toAbsUrl("/account"); // ← enforce /account
+    const title   = (notif.title ?? req.title ?? "Bechobazaar");
+    const text    = (notif.body  ?? req.body  ?? "You have a new notification");
+    const image   = notif.imageUrl || req.imageUrl || "";
+    const openAbs = toAbsUrl("/account");
 
     // 3) Endpoints
     const userRef = db.collection("users").doc(uid);
@@ -117,8 +117,8 @@ export async function handler(event) {
     if (fcmTokens.length) {
       const msg = {
         tokens: fcmTokens,
-        notification: { title, body: text, image: image || undefined },
-        data: { open: openAbs, notifId },
+        notification: { title, body: text, image: image || undefined }, // image here
+        data: { open: openAbs, notifId, image_url: image || "" },       // and here
         webpush: {
           fcmOptions: { link: openAbs },
           headers: { Urgency: "high" },
@@ -177,6 +177,7 @@ export async function handler(event) {
       }
     }
 
+    // 6) Done
     return {
       statusCode: 200,
       headers: corsHeaders(event.headers?.origin || "*"),

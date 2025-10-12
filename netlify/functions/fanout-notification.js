@@ -1,35 +1,31 @@
 // netlify/functions/fanout-notification.js
 import { getAdmin, corsHeaders, corsPreflight } from "./_admin.js";
 
-const SITE_ORIGIN = "https://bechobazaar.com";
+const SITE_ORIGIN = "https://Bechobazaar.com";
 
-/* ---------- helpers ---------- */
-
-// Build the absolute site URL for server-side fetches
+// Build absolute site URL for server-side fetches
 function getBaseUrl(event) {
-  // Prefer Netlify-provided URLs
   const envUrl = process.env.URL || process.env.DEPLOY_PRIME_URL || process.env.DEPLOY_URL;
   if (envUrl) return envUrl.replace(/\/+$/, "");
-  // Fallback to headers
   const proto = (event.headers && (event.headers["x-forwarded-proto"] || event.headers["X-Forwarded-Proto"])) || "https";
   const host  = (event.headers && (event.headers.host || event.headers.Host)) || "";
   return `${proto}://${host}`;
 }
 
-// Make absolute URL from relative path
+// Always resolve path to absolute (default /account)
 function toAbsUrl(pathOrUrl) {
-  const open = (pathOrUrl || "/notifications") + "";
+  const open = (pathOrUrl || "/account") + ""; // ← default account
   return open.startsWith("http")
     ? open
     : (SITE_ORIGIN + (open.startsWith("/") ? open : ("/" + open)));
 }
 
-// Push only via Appilix proxy (no Firestore/FCM)
+// Appilix-only push (for fallback)
 async function appilixOnlyPush(event, { userId, title, body, imageUrl, open }) {
-  if (!userId) throw new Error("userId required for Appilix-only path");
+  if (!userId) throw new Error("userId required");
   const base = getBaseUrl(event);
   const url  = `${base}/.netlify/functions/send-appilix-push`;
-  const openAbs = toAbsUrl(open);
+  const openAbs = toAbsUrl(open || "/account"); // force /account
 
   const res = await fetch(url, {
     method: "POST",
@@ -45,8 +41,6 @@ async function appilixOnlyPush(event, { userId, title, body, imageUrl, open }) {
   return { ok: res.ok, appilix: res.ok ? "sent" : "failed" };
 }
 
-/* ---------- handler ---------- */
-
 export async function handler(event) {
   const pre = corsPreflight(event);
   if (pre) return pre;
@@ -58,14 +52,14 @@ export async function handler(event) {
   try {
     const req = JSON.parse(event.body || "{}");
 
-    // FAST PATH: If service account env is missing → Appilix-only (no Firestore/FCM)
+    // If no service account, fallback Appilix-only so UI not blocked
     if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
       const out = await appilixOnlyPush(event, {
         userId:  req.userId,
         title:   req.title,
         body:    req.body,
         imageUrl:req.imageUrl,
-        open:    req.open
+        open:    "/account" // enforce account
       });
       return {
         statusCode: out.ok ? 200 : 500,
@@ -74,32 +68,10 @@ export async function handler(event) {
       };
     }
 
-    // NORMAL PATH: Initialize firebase-admin via _admin.js (decodes base64 env)
-    let admin, db;
-    try {
-      ({ admin, db } = getAdmin());
-    } catch (e) {
-      // Env present but invalid → still try Appilix-only so UX isn't blocked
-      const out = await appilixOnlyPush(event, {
-        userId:  req.userId,
-        title:   req.title,
-        body:    req.body,
-        imageUrl:req.imageUrl,
-        open:    req.open
-      });
-      return {
-        statusCode: out.ok ? 200 : 500,
-        headers: corsHeaders(event.headers?.origin || "*"),
-        body: JSON.stringify({
-          ok: !!out.ok,
-          fcm: "skipped (env invalid)",
-          appilix: out.appilix,
-          hint: "Check FIREBASE_SERVICE_ACCOUNT base64 value"
-        })
-      };
-    }
+    // Initialize admin (base64 decode happens in _admin)
+    const { admin, db } = getAdmin();
 
-    // 1) Load/create notification doc
+    // 1) Load/create notification
     const notifCol = db.collection("notifications");
     let notifId = req.notifId || null;
     let notif = null;
@@ -115,7 +87,7 @@ export async function handler(event) {
         title:   req.title   || "Bechobazaar",
         body:    req.body    || "",
         imageUrl:req.imageUrl|| "",
-        open:    req.open    || "/notifications",
+        open:    "/account",         // ← enforce /account
         seen: false,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       };
@@ -124,24 +96,23 @@ export async function handler(event) {
       notif = { id: ref.id, ...doc };
     }
 
-    // 2) Prepare payload bits
+    // 2) Prepare payload
     const uid     = notif.userId;
     const title   = notif.title || "Bechobazaar";
     const text    = notif.body  || "You have a new notification";
     const image   = notif.imageUrl || "";
-    const openAbs = toAbsUrl(notif.open);
+    const openAbs = toAbsUrl("/account"); // ← enforce /account
 
-    // 3) Endpoints: FCM tokens + Appilix identities
+    // 3) Endpoints
     const userRef = db.collection("users").doc(uid);
     const [userSnap, fcmSnap] = await Promise.all([
       userRef.get(),
       userRef.collection("fcmTokens").get()
     ]);
-
     const fcmTokens  = fcmSnap.docs.map(d => (d.get("token") || "")).filter(Boolean);
     const appilixIds = userSnap.exists ? Object.keys(userSnap.get("appilixIds") || {}) : [];
 
-    // 4) Send FCM (web)
+    // 4) FCM (web)
     let fcm = { sent: 0, failed: 0, pruned: 0 };
     if (fcmTokens.length) {
       const msg = {
@@ -178,7 +149,7 @@ export async function handler(event) {
       }
     }
 
-    // 5) Send Appilix (native) via proxy — absolute URL on server
+    // 5) Appilix (native)
     let appilix = { sent: 0, failed: 0 };
     if (appilixIds.length) {
       const base = getBaseUrl(event);
@@ -206,17 +177,12 @@ export async function handler(event) {
       }
     }
 
-    // 6) Done
     return {
       statusCode: 200,
       headers: corsHeaders(event.headers?.origin || "*"),
       body: JSON.stringify({ ok: true, notifId, fcm, appilix })
     };
   } catch (e) {
-    return {
-      statusCode: 500,
-      headers: corsHeaders(event.headers?.origin || "*"),
-      body: JSON.stringify({ ok:false, error:String(e.message||e) })
-    };
+    return { statusCode: 500, headers: corsHeaders(event.headers?.origin || "*"), body: JSON.stringify({ ok:false, error:String(e.message||e) }) };
   }
 }

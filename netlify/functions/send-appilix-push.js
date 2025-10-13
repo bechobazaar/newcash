@@ -46,7 +46,14 @@ export async function handler(event) {
     form.set("notification_body", message || "");
     form.set("open_link_url", open_link_url);
     if (user_identity) form.set("user_identity", user_identity); // targeted
-    if (image_url) form.set("image_url", image_url);             // thumbnail (if Appilix supports)
+    // inside send-appilix-push.js, when building the form:
+if (image_url) {
+  form.set("image_url", image_url);        // common
+  form.set("image", image_url);            // alt
+  form.set("notification_image", image_url); // some providers use this
+  form.set("big_picture", image_url);      // Android big-picture style
+}
+          // thumbnail (if Appilix supports)
 
     // Call Appilix
     const resp = await fetch("https://appilix.com/api/push-notification", {

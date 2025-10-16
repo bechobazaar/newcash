@@ -14,7 +14,7 @@ function getAdminApp() {
   if (admin.apps.length) return admin.app();
 
   // Prefer single Base64-encoded service account JSON
-  const base64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
+  const base64 = process.env.FIREBASE_SERVICE_ACCOUNT_B64;
   if (base64) {
     const json = JSON.parse(decodeBase64(base64));
     admin.initializeApp({

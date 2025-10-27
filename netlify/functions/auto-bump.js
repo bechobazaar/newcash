@@ -167,7 +167,7 @@ exports.handler = async () => {
           seen: false,
           timestamp: admin.firestore.FieldValue.serverTimestamp(),
           bump: { plan },
-          targetUrl: `/detail.html?id=${encodeURIComponent(doc.id)}`,
+          targetUrl: `/account.html`,
         });
         notified++;
       }

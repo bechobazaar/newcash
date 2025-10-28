@@ -4,17 +4,18 @@
 
 const https = require("https");
 
-const ENV      = process.env.CASHFREE_ENV === "sandbox" ? "sandbox" : "production";
-const CF_HOST  = ENV === "sandbox" ? "sandbox.cashfree.com" : "api.cashfree.com";
-const CF_APP_ID   = process.env.CASHFREE_APP_ID || "";
-const CF_SECRET   = process.env.CASHFREE_SECRET_KEY || "";
-const ALLOWED = (process.env.ALLOWED_ORIGINS || "")
+const ENV        = process.env.CASHFREE_ENV === "sandbox" ? "sandbox" : "production";
+const CF_HOST    = ENV === "sandbox" ? "sandbox.cashfree.com" : "api.cashfree.com";
+const CF_APP_ID  = process.env.CASHFREE_APP_ID || "";
+const CF_SECRET  = process.env.CASHFREE_SECRET_KEY || "";
+const ALLOWED    = (process.env.ALLOWED_ORIGINS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
 
 // 💡 Cashfree suggests newest versions; 2022-09-01 also works.
 // If you’ve enabled newer APIs on your account, bump this to "2025-01-01".
 const CF_API_VERSION = process.env.CASHFREE_API_VERSION || "2022-09-01";
 
+/* ---------------- CORS helpers ---------------- */
 function pickOrigin(event) {
   const reqOrigin =
     event.headers?.origin ||
@@ -24,7 +25,6 @@ function pickOrigin(event) {
   if (ALLOWED.includes(reqOrigin)) return reqOrigin;
   return ALLOWED[0] || "";
 }
-
 function corsHeaders(event) {
   const allowOrigin = pickOrigin(event);
   const base = {
@@ -34,7 +34,6 @@ function corsHeaders(event) {
   if (allowOrigin) base["Access-Control-Allow-Origin"] = allowOrigin;
   return base;
 }
-
 function ok(body, event) {
   return { statusCode: 200, headers: corsHeaders(event), body: JSON.stringify(body) };
 }
@@ -42,6 +41,7 @@ function bad(status, msg, event) {
   return { statusCode: status, headers: corsHeaders(event), body: JSON.stringify({ error: msg }) };
 }
 
+/* ---------------- tiny https client ---------------- */
 function httpsJSON({ host, path, method = "GET", headers = {} }) {
   const opts = {
     host,
@@ -78,7 +78,7 @@ function httpsJSON({ host, path, method = "GET", headers = {} }) {
   });
 }
 
-/** Map Cashfree payment_group to a simple UI label */
+/* ---------------- helpers ---------------- */
 function groupToLabel(g) {
   if (!g) return null;
   const x = String(g).toLowerCase();
@@ -93,27 +93,25 @@ function groupToLabel(g) {
 function summarizePayment(payments) {
   if (!Array.isArray(payments) || payments.length === 0) return null;
 
-  // Prefer SUCCESS, else first element (Cashfree lists latest first)
+  // Prefer SUCCESS, else first (Cashfree returns latest first)
   const byStatus = payments.find(p => String(p.payment_status).toUpperCase() === "SUCCESS");
   const pick = byStatus || payments[0];
 
-  const group = pick.payment_group || null;
+  const group  = pick.payment_group || null;
   const method = pick.payment_method || {};
-  // Common masked details you might want to surface:
-  // - method.upi?.upi_id
-  // - method.card?.card_network, method.card?.card_type, method.card?.card_number (masked)
-  // - method.netbanking?.netbanking_bank_code / netbanking_bank_name
+
   return {
     cf_payment_id: pick.cf_payment_id || null,
     payment_group: group || null,
     payment_label: groupToLabel(group),
-    payment_method: method,             // keep raw (masked) object for admin/debug
+    payment_method: method,             // masked object (upi/card/netbanking/wallet/pay_later)
     bank_reference: pick.bank_reference || null,
     payment_time: pick.payment_time || null,
     payment_status: pick.payment_status || null,
   };
 }
 
+/* ---------------- handler ---------------- */
 exports.handler = async (event) => {
   if (event.httpMethod === "OPTIONS") {
     return { statusCode: 200, headers: corsHeaders(event), body: "" };
@@ -151,17 +149,23 @@ exports.handler = async (event) => {
     const payment_summary = summarizePayment(payments);
 
     // 3) Response: concise + tags for resume flow
+    //    + compatibility fields for your frontend:
+    //      - status (mirror of order_status)
+    //      - payment_method (top-level), so pollInfo?.payment_method works
     const resp = {
       order_id: order.order_id,
-      order_status: order.order_status,
+      order_status: order.order_status,               // e.g., PAID / ACTIVE / EXPIRED
+      status: order.order_status,                     // 👈 compatibility mirror
       cf_order_id: order.cf_order_id,
       order_amount: order.order_amount,
       order_currency: order.order_currency,
       order_tags: order.order_tags || {},
-      // Optional raw attempts (comment out if you want lean response)
+      // Optional raw attempts (keep if you want richer analytics)
       payments,
-      // 🆕 Friendly summary for UI & Firestore
+      // Friendly summary for UI & Firestore
       payment_summary,
+      // 👇 top-level convenience, used by your resumePaymentIfPending()
+      payment_method: payment_summary?.payment_method || null,
     };
 
     return ok(resp, event);

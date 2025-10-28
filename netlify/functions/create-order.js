@@ -4,7 +4,6 @@
 // - No user email/phone required on client. We send safe placeholders here.
 
 const https = require("https");
-const { URL } = require("url");
 
 // ====== ENV ======
 const ENV = process.env.CASHFREE_ENV === "sandbox" ? "sandbox" : "production";
@@ -12,10 +11,12 @@ const CF_HOST = ENV === "sandbox" ? "sandbox.cashfree.com" : "api.cashfree.com";
 const CF_ORDERS_PATH = "/pg/orders";
 const CF_APP_ID = process.env.CASHFREE_APP_ID || "";
 const CF_SECRET = process.env.CASHFREE_SECRET_KEY || "";
-const RETURN_URL = process.env.RETURN_URL || "https://www.bechobazaar.com/account.html?cf=true&order_id={order_id}";
+const RETURN_URL =
+  process.env.RETURN_URL ||
+  "https://www.bechobazaar.com/account.html?cf=true&order_id={order_id}";
 const ALLOWED = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
-  .map(s => s.trim())
+  .map((s) => s.trim())
   .filter(Boolean);
 
 // ====== CORS helpers ======
@@ -36,8 +37,7 @@ function corsHeaders(event) {
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
   };
-  // set a single value only
-  if (allowOrigin) base["Access-Control-Allow-Origin"] = allowOrigin;
+  if (allowOrigin) base["Access-Control-Allow-Origin"] = allowOrigin; // single value only
   return base;
 }
 
@@ -166,14 +166,15 @@ exports.handler = async (event) => {
     },
     order_meta: {
       return_url: RETURN_URL, // Cashfree will replace {order_id}
-      // notify_url: "...", // (optional) if you add a webhook
+      // 🔽 ADD: prefer UPI so intent icons can show when enabled on your merchant
+      payment_methods: "upi",
+      // notify_url: "...", // (optional) your webhook
     },
     // Tags help your frontend resume the right flow after redirect
     order_tags: {
       purpose: purpose || "boost",
       adId: adId || "",
       amount: String(amount),
-      // If you also send planDays from client, include it here:
       planDays: payload.planDays ? String(payload.planDays) : "",
     },
   };
@@ -195,9 +196,7 @@ exports.handler = async (event) => {
   } catch (e) {
     const status = e.statusCode || 500;
     const message =
-      e.body?.message ||
-      e.message ||
-      "Failed to create order with Cashfree";
+      e.body?.message || e.message || "Failed to create order with Cashfree";
     return bad(status, message, event);
   }
 };

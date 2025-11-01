@@ -2,7 +2,7 @@
 const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
 
 // ==== 🔑 API KEYS (server-side only; DO NOT put in frontend) ====
-const GEMINI_KEY = process.env.GEMINI_API_KEY || "PASTE_YOUR_GEMINI_KEY_HERE"; // <— yahan apni key paste karein
+const GEMINI_KEY = process.env.GEMINI_API_KEY || "AIzaSyD6Uvvth0RMC-I44K3vcan13JcSKPyIZrw"; // <— yahan apni key paste karein
 // (Optional) Google CSE for web snippets:
 const CSE_KEY   = process.env.CSE_KEY   || "";  // optional
 const CSE_CX    = process.env.CSE_CX    || "";  // optional

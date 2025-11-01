@@ -1,11 +1,58 @@
 // netlify/functions/price-advisor.js
+// Node 18 runtime (global fetch available)
+
+// ---- If env vars aren't possible, keep a SERVER-SIDE fallback here.
+// DO NOT put this anywhere in frontend code or public repos.
+const HARD_GEMINI_KEY = "AIzaSyD6Uvvth0RMC-I44K3vcan13JcSKPyIZrw"; // <-- your key here
+const HARD_CSE_KEY    = ""; // optional
+const HARD_CSE_CX     = ""; // optional
+
+// Allow only your domains to call this function
+const ORIGIN_ALLOW = new Set([
+  "https://bechobazaar.com",
+  "https://www.bechobazaar.com",
+  "http://localhost:8888",
+  "http://127.0.0.1:5500"
+]);
+
+// Tiny in-memory rate limiter per function instance
+let __hits = 0;
+const MAX_HITS = 300;            // tune as needed per cold start instance
+const WINDOW_MS = 5 * 60 * 1000; // 5 min
+let __startedAt = Date.now();
 
 const GEMINI_ENDPOINT =
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent";
 
 exports.handler = async (event) => {
+  // --- CORS / Origin check
+  const origin = event.headers.origin || event.headers.Origin || "";
+  if (origin && !ORIGIN_ALLOW.has(origin)) {
+    return { statusCode: 403, body: "Forbidden (origin)" };
+  }
+
+  if (event.httpMethod === "OPTIONS") {
+    return {
+      statusCode: 204,
+      headers: {
+        "access-control-allow-origin": origin || "*",
+        "access-control-allow-methods": "POST,OPTIONS",
+        "access-control-allow-headers": "content-type"
+      },
+      body: ""
+    };
+  }
+
   if (event.httpMethod !== "POST") {
     return { statusCode: 405, body: "Method Not Allowed" };
+  }
+
+  // --- simple rate-limit
+  const now = Date.now();
+  if (now - __startedAt > WINDOW_MS) { __startedAt = now; __hits = 0; }
+  __hits++;
+  if (__hits > MAX_HITS) {
+    return { statusCode: 429, body: "Too Many Requests" };
   }
 
   try {
@@ -13,8 +60,9 @@ exports.handler = async (event) => {
 
     // ---- (Optional) Google Custom Search snippets
     let webSnippets = [];
-    const CSE_KEY = process.env.CSE_KEY;
-    const CSE_CX  = process.env.CSE_CX;
+    const CSE_KEY = process.env.CSE_KEY || HARD_CSE_KEY;
+    const CSE_CX  = process.env.CSE_CX  || HARD_CSE_CX;
+
     if (wantWeb && CSE_KEY && CSE_CX) {
       const qBase = [item?.brand, item?.model, item?.variant, "India price"]
         .filter(Boolean).join(" ");
@@ -24,7 +72,7 @@ exports.handler = async (event) => {
         `${item?.brand || ""} ${item?.model || ""} used price India`,
       ];
       for (const q of queries) {
-        try{
+        try {
           const r = await fetch(
             `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(CSE_KEY)}&cx=${encodeURIComponent(CSE_CX)}&num=3&q=${encodeURIComponent(q)}`
           );
@@ -37,12 +85,12 @@ exports.handler = async (event) => {
               }))
             });
           }
-        }catch{}
+        } catch {/* ignore */}
       }
     }
 
     // ---- Gemini
-    const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+    const GEMINI_API_KEY = process.env.GEMINI_API_KEY || HARD_GEMINI_KEY;
     if (!GEMINI_API_KEY) {
       return { statusCode: 500, body: "Missing GEMINI_API_KEY" };
     }
@@ -66,7 +114,8 @@ exports.handler = async (event) => {
         reasoningPoints: { type: "array", items: { type: "string" } },
         compsUsed: { type: "array", items: { type: "object" } },
         caveats: { type: "array", items: { type: "string" } },
-        sources: { type: "array", items: { type: "object" } }
+        sources: { type: "array", items: { type: "object",
+          properties: { title: {type:"string"}, link: {type:"string"} } } }
       },
       required: ["priceBands","summary"]
     };
@@ -93,7 +142,8 @@ Return INR whole numbers and three bands: quick/suggested/patient. JSON only.`;
     };
 
     const resp = await fetch(`${GEMINI_ENDPOINT}?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
-      method: "POST", headers: { "content-type": "application/json" },
+      method: "POST",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(body)
     });
 
@@ -104,7 +154,15 @@ Return INR whole numbers and three bands: quick/suggested/patient. JSON only.`;
 
     const data = await resp.json();
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-    return { statusCode: 200, headers: { "content-type": "application/json" }, body: text };
+
+    return {
+      statusCode: 200,
+      headers: {
+        "content-type": "application/json",
+        "access-control-allow-origin": origin || "*"
+      },
+      body: text
+    };
   } catch (e) {
     return { statusCode: 500, body: String(e?.message || e) };
   }

@@ -1,4 +1,5 @@
-// Node 18+ (native fetch)
+// netlify/functions/price-advisor.js
+// Node 18+ (native fetch). No external deps.
 
 const MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
 const GEMINI_ENDPOINT =
@@ -40,13 +41,16 @@ exports.handler = async (ev) => {
 
   const { item = {}, comps = [] } = payload;
 
-  // Required fields
+  // Required fields (aap Step-4 pe bhej rahe ho — ensure we have basics)
   for (const m of ["category","brand","title","city","state"]) {
     if (!(item[m] && String(item[m]).trim())) return bad(400, `Missing item.${m}`);
   }
 
-  // Percentiles from comps
-  const prices = comps.map(c => Number(c.price)).filter(n => Number.isFinite(n) && n > 0).sort((a,b)=>a-b);
+  // ---- Percentiles (robust) ----
+  const prices = comps.map(c => Number(c.price))
+    .filter(n => Number.isFinite(n) && n > 0)
+    .sort((a,b)=>a-b);
+
   const pct = (p) => {
     if (!prices.length) return null;
     const idx = (p/100) * (prices.length - 1);
@@ -59,6 +63,7 @@ exports.handler = async (ev) => {
   const p25    = pct(25);
   const p75    = pct(75);
 
+  // Bands (fallback if comps missing)
   const quick     = median ? Math.round(median * 0.96) : (item.price ? Math.round(item.price*0.95) : null);
   const suggested = median ? Math.round(median)        : (item.price || null);
   const patient   = median ? Math.round(median * 1.05) : (item.price ? Math.round(item.price*1.05) : null);
@@ -74,13 +79,14 @@ exports.handler = async (ev) => {
     state: c.state || ""
   }));
 
+  // System brief
   const sys = `
 You are a marketplace pricing analyst for a used-goods classifieds app in India.
 Write a tight, non-fluffy assessment the seller can read in 10–12 seconds.
 Tone: precise, confident, friendly. No marketing jargon. Avoid hallucination.
 If comps are few, say so clearly.
 Always output a one-paragraph summary and 3–5 bullet strategy points.
-Use Indian rupee style (e.g., ₹1,24,999). Avoid ranges like "10–50k" if not justified.
+Use Indian rupee style (e.g., ₹1,24,999). Avoid unjustified wide ranges.
 Say if the entered price is Overpriced / Fair / Undervalued relative to comps.
 `.trim();
 
@@ -103,7 +109,7 @@ No markdown in JSON values. Keep it factual.
     generationConfig: { temperature: 0.3, maxOutputTokens: 512 }
   };
 
-  let aiJson = { summary: "", strategy: [], caveats: [] };
+  let report = { summary: "", strategy: [], caveats: [] };
 
   try {
     const r = await fetch(`${GEMINI_ENDPOINT}?key=${encodeURIComponent(key)}`, {
@@ -114,17 +120,17 @@ No markdown in JSON values. Keep it factual.
 
     if (!r.ok) {
       const t = await r.text();
-      return ok({ priceBands, report: aiJson, caveats: [`Gemini API error: ${t}`], debug: { status: r.status, body: t } });
+      return ok({ priceBands, report, caveats: [`Gemini API error: ${t}`], debug: { status: r.status, body: t } });
     }
 
     const data = await r.json();
     const txt = data?.candidates?.[0]?.content?.parts?.map(p=>p.text).join("\n") || "{}";
-    try { aiJson = JSON.parse(txt); }
-    catch { aiJson = { summary: txt.slice(0, 400), strategy: [], caveats: ["Could not parse full JSON"] }; }
+    try { report = JSON.parse(txt); }
+    catch { report = { summary: txt.slice(0, 400), strategy: [], caveats: ["Could not parse full JSON"] }; }
 
   } catch (e) {
-    return ok({ priceBands, report: aiJson, caveats: [`Gemini call failed: ${String(e.message||e)}`] });
+    return ok({ priceBands, report, caveats: [`Gemini call failed: ${String(e.message||e)}`] });
   }
 
-  return ok({ priceBands, report: aiJson });
+  return ok({ priceBands, report });
 };

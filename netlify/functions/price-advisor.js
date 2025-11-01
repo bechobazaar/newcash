@@ -107,32 +107,61 @@ exports.handler = async (event) => {
       return respond(500, { error: "Missing GEMINI_API_KEY" }, origin);
     }
 
-    // JSON schema (reportMd added)
-    const schema = {
+   const schema = {
+  type: "object",
+  properties: {
+    summary: { type: "string" },
+    reportMd: { type: "string" },
+    priceBands: {
       type: "object",
       properties: {
-        summary: { type: "string" },
-        reportMd: { type: "string" },
-        priceBands: {
-          type: "object",
-          properties: {
-            quick: { type: "number" },
-            suggested: { type: "number" },
-            patient: { type: "number" },
-            median: { type: "number" },
-            p25: { type: "number" },
-            p75: { type: "number" }
-          },
-          required: ["suggested"]
-        },
-        reasoningPoints: { type: "array", items: { type: "string" } },
-        compsUsed: { type: "array", items: { type: "object" } },
-        caveats: { type: "array", items: { type: "string" } },
-        sources: { type: "array", items: { type: "object",
-          properties: { title: {type:"string"}, link: {type:"string"} } } }
+        quick: { type: "number" },
+        suggested: { type: "number" },
+        patient: { type: "number" },
+        median: { type: "number" },
+        p25: { type: "number" },
+        p75: { type: "number" }
       },
-      required: ["priceBands","summary"]
-    };
+      required: ["suggested"]
+    },
+    reasoningPoints: { type: "array", items: { type: "string" } },
+
+    // 👇 IMPORTANT: give non-empty properties here
+    compsUsed: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          price: { type: "number" },
+          brand: { type: "string" },
+          model: { type: "string" },
+          city:  { type: "string" },
+          state: { type: "string" },
+          postedAt: { type: "string" },     // ISO date or human text—model may emit string
+          url: { type: "string" }            // optional link if inferred from snippet
+        },
+        required: ["title", "price"]
+      }
+    },
+
+    caveats: { type: "array", items: { type: "string" } },
+    sources: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          link:  { type: "string" },
+          snippet: { type: "string" }
+        },
+        required: ["title"]
+      }
+    }
+  },
+  required: ["priceBands","summary"]
+};
+
 
     const prompt =
 `You are a pricing analyst for an Indian classifieds marketplace.

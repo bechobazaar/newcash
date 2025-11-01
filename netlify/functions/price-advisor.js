@@ -1,9 +1,9 @@
 // netlify/functions/price-advisor.js
 
 // ============= CONFIG (edit these) =============
-const HARD_GEMINI_KEY = "AIzaSyD6Uvvth0RMC-I44K3vcan13JcSKPyIZrw"; // <-- put your key
-const HARD_CSE_KEY    = "";   // optional (Google Custom Search)
-const HARD_CSE_CX     = "";   // optional (Google Custom Search CX)
+const HARD_GEMINI_KEY = "AIzaSyD6Uvvth0RMC-I44K3vcan13JcSKPyIZrw"; // fallback if env not used
+const HARD_CSE_KEY    = "";  // optional: Google Custom Search key
+const HARD_CSE_CX     = "";  // optional: Google Custom Search CX
 
 // Allowed front-end origins
 const ORIGIN_ALLOW = new Set([
@@ -14,23 +14,23 @@ const ORIGIN_ALLOW = new Set([
   "http://127.0.0.1:5500",
 ]);
 
-// Gemini v1 endpoint (pick one)
+// Gemini v1 endpoint
 const GEMINI_ENDPOINT =
   "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent";
-// Cheaper option:
+// (Cheaper alt)
 // const GEMINI_ENDPOINT =
 //   "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-002:generateContent";
 
 // ============= UTILITIES =============
 let __hits = 0;
 let __winStart = Date.now();
-const MAX_HITS = 300;           // per window
-const WINDOW_MS = 5 * 60 * 1000;
+const MAX_HITS = 300;             // per window
+const WINDOW_MS = 5 * 60 * 1000;  // 5 mins
 
 function corsHeaders(origin) {
   const allow = ORIGIN_ALLOW.has(origin) ? origin : "";
   return {
-    "access-control-allow-origin": allow,  // empty => browser will block
+    "access-control-allow-origin": allow,
     "access-control-allow-methods": "POST,OPTIONS",
     "access-control-allow-headers": "content-type",
     "content-type": "application/json",
@@ -47,19 +47,11 @@ function respond(statusCode, body, origin, extra = {}) {
 
 function tryParseJsonFromText(text) {
   if (!text) return null;
-  // 1) direct
   try { return JSON.parse(text); } catch {}
-  // 2) fenced code block
   const m = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (m) {
-    try { return JSON.parse(m[1]); } catch {}
-  }
-  // 3) first { ... } block
-  const i = text.indexOf("{");
-  const j = text.lastIndexOf("}");
-  if (i >= 0 && j > i) {
-    try { return JSON.parse(text.slice(i, j + 1)); } catch {}
-  }
+  if (m) { try { return JSON.parse(m[1]); } catch {} }
+  const i = text.indexOf("{"), j = text.lastIndexOf("}");
+  if (i >= 0 && j > i) { try { return JSON.parse(text.slice(i, j + 1)); } catch {} }
   return null;
 }
 
@@ -72,7 +64,7 @@ exports.handler = async (event) => {
     return { statusCode: 204, headers: corsHeaders(origin), body: "" };
   }
 
-  // Enforce CORS allow-list (still return CORS headers for clarity)
+  // CORS gate (still returns headers so browser explains it)
   if (origin && !ORIGIN_ALLOW.has(origin)) {
     return respond(403, { error: "Forbidden (origin)" }, origin);
   }
@@ -84,10 +76,7 @@ exports.handler = async (event) => {
 
   // Simple rate-limit
   const now = Date.now();
-  if (now - __winStart > WINDOW_MS) {
-    __winStart = now;
-    __hits = 0;
-  }
+  if (now - __winStart > WINDOW_MS) { __winStart = now; __hits = 0; }
   if (++__hits > MAX_HITS) {
     return respond(429, { error: "Too Many Requests" }, origin);
   }
@@ -95,15 +84,14 @@ exports.handler = async (event) => {
   try {
     const { item, comps, wantWeb = true } = JSON.parse(event.body || "{}");
 
-    // Optional: Google Custom Search web snippets
+    // Optional: Google Custom Search snippets
     const CSE_KEY = process.env.CSE_KEY || HARD_CSE_KEY;
     const CSE_CX  = process.env.CSE_CX  || HARD_CSE_CX;
     let webSnippets = [];
 
     if (wantWeb && CSE_KEY && CSE_CX) {
       const qBase = [item?.brand, item?.model, item?.variant, "India price"]
-        .filter(Boolean)
-        .join(" ");
+        .filter(Boolean).join(" ");
       const queries = [
         qBase,
         `${item?.brand || ""} ${item?.model || ""} launch price India`,
@@ -113,34 +101,28 @@ exports.handler = async (event) => {
       for (const q of queries) {
         try {
           const r = await fetch(
-            `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(
-              CSE_KEY
-            )}&cx=${encodeURIComponent(CSE_CX)}&num=3&q=${encodeURIComponent(q)}`
+            `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(CSE_KEY)}&cx=${encodeURIComponent(CSE_CX)}&num=3&q=${encodeURIComponent(q)}`
           );
           if (r.ok) {
             const data = await r.json();
             webSnippets.push({
               query: q,
-              items: (data.items || []).map((it) => ({
-                title: it.title,
-                link: it.link,
-                snippet: it.snippet,
-              })),
+              items: (data.items || []).map(it => ({
+                title: it.title, link: it.link, snippet: it.snippet
+              }))
             });
           }
-        } catch {
-          // ignore snippet fetch errors
-        }
+        } catch { /* ignore */ }
       }
     }
 
-    // Gemini API key
+    // Gemini API key (env or hardcoded fallback)
     const GEMINI_API_KEY = process.env.GEMINI_API_KEY || HARD_GEMINI_KEY;
     if (!GEMINI_API_KEY) {
       return respond(500, { error: "Missing GEMINI_API_KEY" }, origin);
     }
 
-    // Prompt-only JSON contract (no schema keys)
+    // Prompt-based JSON contract (no responseSchema/responseMimeType for v1)
     const prompt = `You are a pricing analyst for an Indian classifieds marketplace.
 Use COMPARABLE_LISTINGS first; PUBLIC_SNIPPETS only as context. Trim outliers (approx 10–90 percentile).
 Output INR whole numbers only.
@@ -159,36 +141,22 @@ Constraints:
 - If unsure about a field, omit it rather than guessing wildly.`;
 
     const body = {
-      contents: [
-        {
-          role: "user",
-          parts: [
-            { text: prompt },
-            { text: "ITEM:" },
-            { text: JSON.stringify(item || {}) },
-            { text: "COMPARABLE_LISTINGS:" },
-            { text: JSON.stringify(comps || []) },
-            { text: "PUBLIC_SNIPPETS:" },
-            { text: JSON.stringify(webSnippets) },
-          ],
-        },
-      ],
-      generationConfig: {
-        temperature: 0.2,
-        topP: 0.9,
-        maxOutputTokens: 1400,
-        // IMPORTANT: Do NOT send responseSchema/responseMimeType for v1 here.
-      },
+      contents: [{
+        role: "user",
+        parts: [
+          { text: prompt },
+          { text: "ITEM:" },               { text: JSON.stringify(item || {}) },
+          { text: "COMPARABLE_LISTINGS:" },{ text: JSON.stringify(comps || []) },
+          { text: "PUBLIC_SNIPPETS:" },    { text: JSON.stringify(webSnippets) }
+        ]
+      }],
+      generationConfig: { temperature: 0.2, topP: 0.9, maxOutputTokens: 1400 }
     };
 
-    const resp = await fetch(
-      `${GEMINI_ENDPOINT}?key=${encodeURIComponent(GEMINI_API_KEY)}`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      }
-    );
+    const resp = await fetch(`${GEMINI_ENDPOINT}?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
 
     if (!resp.ok) {
       const t = await resp.text();
@@ -197,8 +165,6 @@ Constraints:
 
     const data = await resp.json();
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-
-    // Try to parse JSON from the text (handles code fences too)
     const parsed = tryParseJsonFromText(text);
     if (!parsed) {
       return respond(502, { error: "AI returned non-JSON or unparsable JSON", raw: text }, origin);

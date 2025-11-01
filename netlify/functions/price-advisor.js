@@ -1,152 +1,43 @@
 // netlify/functions/price-advisor.js
-
-// ✅ Supported model + endpoint (v1beta)
-const GEMINI_URL =
+const GEMINI_ENDPOINT =
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
 
-// ✅ CORS allow your sites
-const ALLOWED_ORIGINS = [
-  "https://bechobazaar.com",
-  "https://www.bechobazaar.com",
-  "https://bechobazaar.netlify.app",
-];
-
-const corsHeaders = (origin) => ({
-  "Access-Control-Allow-Origin": ALLOWED_ORIGINS.includes(origin) ? origin : "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, X-Gemini-Key",
-  Vary: "Origin",
-});
-
-// ✅ Fallback key to avoid env size problem (keep repo PRIVATE)
-const GEMINI_FALLBACK_KEY = [
-  // 👉 Replace with your real key (can be whole or split into parts)
-  "AIzaSyD6Uvvth0RMC-I44K3vcan13JcSKPyIZrw"
-].join("");
-
-function resolveGeminiKey(event) {
-  return (
-    process.env.GEMINI_API_KEY ||
-    event.headers["x-gemini-key"] || // optional header path
-    GEMINI_FALLBACK_KEY ||
-    ""
-  );
-}
-
-// ---------- Helpers ----------
-
-// Extract JSON from messy model output
-function extractJSON(text) {
-  if (!text || typeof text !== "string") return null;
-
-  // 1) Fenced ```json … ```
-  const fence = text.match(/```json([\s\S]*?)```/i);
-  if (fence && fence[1]) {
-    try { return JSON.parse(fence[1].trim()); } catch {}
-  }
-  // 2) First {...} block
-  const firstBrace = text.indexOf("{");
-  const lastBrace = text.lastIndexOf("}");
-  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    const slice = text.slice(firstBrace, lastBrace + 1);
-    try { return JSON.parse(slice); } catch {}
-  }
-  // 3) Pure JSON attempt
-  try { return JSON.parse(text.trim()); } catch {}
-  return null;
-}
-
-// Median
-function median(arr) {
-  if (!arr.length) return null;
-  const a = [...arr].sort((x, y) => x - y);
-  const m = Math.floor(a.length / 2);
-  return a.length % 2 ? a[m] : Math.round((a[m - 1] + a[m]) / 2);
-}
-// Percentile (p in [0,100])
-function percentile(arr, p) {
-  if (!arr.length) return null;
-  const a = [...arr].sort((x, y) => x - y);
-  const idx = (p / 100) * (a.length - 1);
-  const lo = Math.floor(idx), hi = Math.ceil(idx);
-  if (lo === hi) return a[lo];
-  const w = idx - lo;
-  return Math.round(a[lo] * (1 - w) + a[hi] * w);
-}
-// Remove outliers via IQR
-function removeOutliers(nums) {
-  if (nums.length < 5) return nums;
-  const a = [...nums].sort((x, y) => x - y);
-  const q1 = percentile(a, 25);
-  const q3 = percentile(a, 75);
-  const iqr = q3 - q1;
-  const lo = q1 - 1.5 * iqr;
-  const hi = q3 + 1.5 * iqr;
-  return a.filter((v) => v >= lo && v <= hi);
-}
-// Build fallback result from comps
-function buildFallbackFromComps(comps) {
-  const prices = (comps || [])
-    .map((c) => Number(c.price))
-    .filter((n) => Number.isFinite(n) && n > 0);
-
-  if (!prices.length) {
-    return null;
-  }
-  const cleaned = removeOutliers(prices);
-  if (!cleaned.length) return null;
-
-  const med = median(cleaned);
-  const p25 = percentile(cleaned, 25);
-  const p75 = percentile(cleaned, 75);
-
-  // Heuristics for quick/suggested/patient
-  const suggested = med;
-  const quick = Math.round((p25 + suggested) / 2);     // slightly below middle
-  const patient = Math.round((p75 + suggested) / 2);   // slightly above middle
-
-  return {
-    summary: "Estimated from comparable listings (AI unavailable).",
-    priceBands: { quick, suggested, patient, median: med, p25, p75 },
-    reasoning: [
-      "Computed median and IQR from comparable listings.",
-      "Removed outliers using 1.5×IQR rule.",
-    ],
-    caveats: [
-      "Fallback used because AI response was empty or non-JSON.",
-      "Adjust for condition, accessories, warranty, and urgency.",
-    ],
-    sources: [],
-    debug: { derivedFrom: cleaned.length, rawCount: prices.length },
-  };
-}
-
 exports.handler = async (event) => {
-  const origin = event.headers.origin || "";
-  const baseHeaders = corsHeaders(origin);
-
-  // CORS preflight
+  // CORS
   if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 204, headers: baseHeaders, body: "" };
+    return {
+      statusCode: 204,
+      headers: {
+        "access-control-allow-origin": "https://bechobazaar.com",
+        "access-control-allow-methods": "POST, OPTIONS",
+        "access-control-allow-headers": "content-type, x-gemini-key"
+      },
+      body: ""
+    };
   }
   if (event.httpMethod !== "POST") {
-    return { statusCode: 405, headers: baseHeaders, body: "Method Not Allowed" };
+    return { statusCode: 405, body: "Method Not Allowed" };
   }
+
+  const corsHeaders = {
+    "access-control-allow-origin": "https://bechobazaar.com",
+    "content-type": "application/json"
+  };
 
   try {
     const { item = {}, comps = [], wantWeb = true } = JSON.parse(event.body || "{}");
 
-    // Optional: Google CSE snippets
+    // ------ (A) Optional web snippets via CSE ------
     let webSnippets = [];
-    const CSE_KEY = process.env.CSE_KEY;
-    const CSE_CX  = process.env.CSE_CX;
+    const CSE_KEY = process.env.CSE_KEY || "";
+    const CSE_CX  = process.env.CSE_CX  || "";
     if (wantWeb && CSE_KEY && CSE_CX) {
       const qBase = [item.brand, item.model, item.variant, "India price"]
         .filter(Boolean).join(" ");
       const queries = [
         qBase,
-        `${item.brand || ""} ${item.model || ""} used price India`,
-        `${item.brand || ""} ${item.model || ""} resale price`,
+        `${item.brand || ""} ${item.model || ""} launch price India`,
+        `${item.brand || ""} ${item.model || ""} used price India`
       ];
       for (const q of queries) {
         try {
@@ -159,131 +50,124 @@ exports.handler = async (event) => {
               query: q,
               items: (data.items || []).map(it => ({
                 title: it.title, link: it.link, snippet: it.snippet
-              })),
+              }))
             });
           }
-        } catch {}
+        } catch (_) {}
       }
     }
 
-    // Resolve key
-    const key = resolveGeminiKey(event);
-    if (!key) {
-      // If no key, try fallback from comps right away
-      const fb = buildFallbackFromComps(comps);
+    // ------ (B) Gemini (key priority: header -> env -> inline fallback) ------
+    const headerKey = (event.headers["x-gemini-key"] || event.headers["X-Gemini-Key"] || "").trim();
+    const envKey    = (process.env.GEMINI_API_KEY || "").trim();
+    const INLINE_FALLBACK = ""; // leave empty; you can paste a key here if you must
+    const GEMINI_API_KEY = headerKey || envKey || INLINE_FALLBACK;
+
+    // Helper: compute bands from comps
+    function computeBandsFromComps(list) {
+      const prices = (list || [])
+        .map(x => Number(x.price || 0))
+        .filter(v => Number.isFinite(v) && v > 0)
+        .sort((a,b)=>a-b);
+      if (!prices.length) return null;
+      const p = (k) => {
+        if (!prices.length) return null;
+        const idx = Math.max(0, Math.min(prices.length - 1, Math.round((k/100)*(prices.length-1))));
+        return Math.round(prices[idx]);
+      };
+      const median = p(50);
+      const p25 = p(25);
+      const p75 = p(75);
+      // Quick/Patient around quartiles
       return {
-        statusCode: 200,
-        headers: { ...baseHeaders, "content-type": "application/json" },
-        body: JSON.stringify(
-          fb || { error: "Missing GEMINI_API_KEY and no comps available." }
-        ),
+        quick: Math.round(p25 || median || prices[0]),
+        suggested: Math.round(median || p50),
+        patient: Math.round(p75 || median || prices[prices.length-1]),
+        median, p25, p75
       };
     }
 
-    // Prompt designed to force a minified JSON only
-    const prompt = [
-      "You are a pricing analyst for an Indian classifieds marketplace.",
-      "Use COMPARABLE_LISTINGS first. Use PUBLIC_SNIPPETS only for context. Drop obvious outliers.",
-      "All prices must be INR whole numbers.",
-      "Return EXACTLY this minified JSON shape and NOTHING else:",
-      `{"summary":"...","priceBands":{"quick":0,"suggested":0,"patient":0,"median":0,"p25":0,"p75":0},"reasoning":["..."],"caveats":["..."],"sources":[{"title":"...","link":"..."}]}`,
-      "If you cannot compute some fields, omit only those keys (do not write null).",
-    ].join(" ");
-
-    const contents = [{
-      role: "user",
-      parts: [
-        { text: prompt },
-        { text: "ITEM:\n" + JSON.stringify(item || {}) },
-        { text: "COMPARABLE_LISTINGS:\n" + JSON.stringify(comps || []) },
-        { text: "PUBLIC_SNIPPETS:\n" + JSON.stringify(webSnippets || []) },
-        { text: "Return ONLY minified JSON. No extra text. No code fences." },
-      ],
-    }];
-
-    const resp = await fetch(`${GEMINI_URL}?key=${encodeURIComponent(key)}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        contents,
-        generationConfig: { temperature: 0.2, topP: 0.9, maxOutputTokens: 1024 },
-      }),
-    });
-
-    if (!resp.ok) {
-      const t = await resp.text();
-      // Try fallback from comps
-      const fb = buildFallbackFromComps(comps);
+    // Helper: heuristic bands from user price when nothing else is available
+    function heuristicBandsFromUser(userPrice) {
+      const n = Math.max(1, Number(userPrice || 0));
+      const quick = Math.round(n * 0.92);
+      const suggested = Math.round(n);
+      const patient = Math.round(n * 1.08);
       return {
-        statusCode: 200,
-        headers: { ...baseHeaders, "content-type": "application/json" },
-        body: JSON.stringify(
-          fb || { error: `Gemini error: ${t}` }
-        ),
+        quick, suggested, patient,
+        median: suggested,
+        p25: Math.round(n * 0.95),
+        p75: Math.round(n * 1.05)
       };
     }
 
-    const data = await resp.json();
-    const candidate = data?.candidates?.[0];
-    const partText = candidate?.content?.parts?.[0]?.text || "";
+    // Try Gemini if a key exists
+    let aiJson = null;
+    if (GEMINI_API_KEY) {
+      const prompt =
+`You are a pricing analyst for an Indian classifieds marketplace.
+Use comparable listings first; public snippets only as weak context.
+Trim outliers. Return INR whole numbers and three bands: quick/suggested/patient.
+JSON only. Keys: summary, priceBands{quick,suggested,patient,median,p25,p75}, reasoning (array), caveats (array), sources (array).`;
 
-    // Try to parse strict JSON
-    let parsed = extractJSON(partText);
+      const body = {
+        contents: [{
+          role: "user",
+          parts: [
+            { text: prompt },
+            { text: "ITEM:" },               { text: JSON.stringify(item || {}) },
+            { text: "COMPARABLE_LISTINGS:" },{ text: JSON.stringify(comps || []) },
+            { text: "PUBLIC_SNIPPETS:" },    { text: JSON.stringify(webSnippets || []) }
+          ]
+        }],
+        generationConfig: {
+          temperature: 0.2, topP: 0.9, maxOutputTokens: 1024
+        }
+      };
 
-    // If still nothing, use comps fallback
-    if (!parsed) {
-      const fb = buildFallbackFromComps(comps);
-      if (fb) {
-        fb.debug = {
-          ...(fb.debug || {}),
-          note: "AI returned non-JSON; fallback used.",
-          finishReason: candidate?.finishReason,
-          safetyRatings: candidate?.safetyRatings,
-          raw: partText?.slice(0, 1200) || "",
-        };
-        return {
-          statusCode: 200,
-          headers: { ...baseHeaders, "content-type": "application/json" },
-          body: JSON.stringify(fb),
-        };
+      const resp = await fetch(`${GEMINI_ENDPOINT}?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+      });
+
+      if (resp.ok) {
+        const data = await resp.json();
+        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+        try { aiJson = JSON.parse(text); } catch (_) { aiJson = null; }
       }
-      // Last resort: send debug so you can see what came back
-      return {
-        statusCode: 200,
-        headers: { ...baseHeaders, "content-type": "application/json" },
-        body: JSON.stringify({
-          summary: "No structured AI output and no comparable listings available.",
-          priceBands: {},
-          reasoning: [],
-          caveats: ["Model output could not be parsed as JSON."],
-          sources: [],
-          debug: {
-            finishReason: candidate?.finishReason,
-            safetyRatings: candidate?.safetyRatings,
-            raw: partText?.slice(0, 1200) || "",
-          },
-        }),
-      };
     }
 
-    // Attach debug info (useful to see why earlier you got {})
-    parsed.debug = {
-      ...(parsed.debug || {}),
-      finishReason: candidate?.finishReason,
-      safetyRatings: candidate?.safetyRatings,
-      raw: partText?.slice(0, 600) || "",
+    // Build final response with fallbacks
+    let out = aiJson || {};
+    if (!out.priceBands || !Number.isFinite(out.priceBands.suggested)) {
+      // try compute from comps
+      const bandsFromComps = computeBandsFromComps(comps);
+      if (bandsFromComps) {
+        out.priceBands = bandsFromComps;
+        out.summary = out.summary || `Computed bands from ${comps.length} comparable listing(s).`;
+      } else {
+        // last resort: heuristic from user price
+        if (Number(item.price)) {
+          out.priceBands = heuristicBandsFromUser(item.price);
+          out.summary = out.summary || "No comparable data available; used your entered price to estimate quick/suggested/patient bands.";
+          out.caveats = out.caveats || [];
+          out.caveats.push("Heuristic based on your entered price. Add comps or enable web snippets for better accuracy.");
+        } else {
+          out.summary = out.summary || "No structured AI output and no comparable listings available.";
+          out.priceBands = out.priceBands || {};
+        }
+      }
+    }
+
+    // Always include minimal debug
+    out.debug = {
+      compsCount: comps?.length || 0,
+      webSnippets: webSnippets?.length || 0,
+      usedAI: !!aiJson
     };
 
-    return {
-      statusCode: 200,
-      headers: { ...baseHeaders, "content-type": "application/json" },
-      body: JSON.stringify(parsed),
-    };
+    return { statusCode: 200, headers: corsHeaders, body: JSON.stringify(out) };
   } catch (e) {
-    return {
-      statusCode: 500,
-      headers: baseHeaders,
-      body: JSON.stringify({ error: String(e?.message || e) }),
-    };
+    return { statusCode: 200, headers: corsHeaders, body: JSON.stringify({ error: String(e?.message || e) }) };
   }
 };

@@ -1,12 +1,11 @@
 // netlify/functions/price-advisor.js
-// Node 18 runtime (global fetch available)
 
 // ====== SERVER-ONLY KEYS (fallback) ======
-const HARD_GEMINI_KEY = "AIzaSyD6Uvvth0RMC-I44K3vcan13JcSKPyIZrw";  // <-- अपनी key भरो (frontend में कभी नहीं)
-const HARD_CSE_KEY    = ""; // optional (Google Custom Search)
-const HARD_CSE_CX     = ""; // optional (Google Custom Search CX id)
+const HARD_GEMINI_KEY = "AIzaSyD6Uvvth0RMC-I44K3vcan13JcSKPyIZrw"; // <— yahan apni key भरो
+const HARD_CSE_KEY    = ""; // optional
+const HARD_CSE_CX     = ""; // optional
 
-// ====== Allow only your origins ======
+// ====== Allowed origins (add both your domains) ======
 const ORIGIN_ALLOW = new Set([
   "https://bechobazaar.com",
   "https://www.bechobazaar.com",
@@ -15,53 +14,70 @@ const ORIGIN_ALLOW = new Set([
   "http://127.0.0.1:5500"
 ]);
 
-
-// ====== Basic in-memory rate-limit per instance ======
-let __hits = 0, __startedAt = Date.now();
-const MAX_HITS = 300, WINDOW_MS = 5*60*1000; // 5 min
-
 const GEMINI_ENDPOINT =
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent";
 
+// very light in-memory rate-limit
+let __hits = 0, __start = Date.now();
+const MAX_HITS = 300, WINDOW_MS = 5 * 60 * 1000;
+
+function corsHeaders(origin) {
+  const allow = ORIGIN_ALLOW.has(origin) ? origin : "";
+  return {
+    "access-control-allow-origin": allow || "",     // if not allowed -> empty (browser will block)
+    "access-control-allow-methods": "POST,OPTIONS",
+    "access-control-allow-headers": "content-type",
+    "content-type": "application/json"
+  };
+}
+
+function respond(statusCode, body, origin, extraHeaders = {}) {
+  return {
+    statusCode,
+    headers: { ...corsHeaders(origin), ...extraHeaders },
+    body: typeof body === "string" ? body : JSON.stringify(body)
+  };
+}
+
 exports.handler = async (event) => {
   const origin = event.headers.origin || event.headers.Origin || "";
-  if (origin && !ORIGIN_ALLOW.has(origin)) {
-    return { statusCode: 403, body: "Forbidden (origin)" };
-  }
 
+  // OPTIONS preflight — ALWAYS return CORS headers
   if (event.httpMethod === "OPTIONS") {
     return {
       statusCode: 204,
-      headers: {
-        "access-control-allow-origin": origin || "*",
-        "access-control-allow-methods": "POST,OPTIONS",
-        "access-control-allow-headers": "content-type"
-      },
+      headers: corsHeaders(origin),
       body: ""
     };
   }
 
+  // check origin early (but still send CORS headers so browser sees explicit block)
+  if (origin && !ORIGIN_ALLOW.has(origin)) {
+    return respond(403, { error: "Forbidden (origin)" }, origin);
+  }
+
   if (event.httpMethod !== "POST") {
-    return { statusCode: 405, body: "Method Not Allowed" };
+    return respond(405, { error: "Method Not Allowed" }, origin);
   }
 
   // rate-limit
   const now = Date.now();
-  if (now - __startedAt > WINDOW_MS) { __startedAt = now; __hits = 0; }
+  if (now - __start > WINDOW_MS) { __start = now; __hits = 0; }
   if (++__hits > MAX_HITS) {
-    return { statusCode: 429, body: "Too Many Requests" };
+    return respond(429, { error: "Too Many Requests" }, origin);
   }
 
   try {
     const { item, comps, wantWeb = true } = JSON.parse(event.body || "{}");
 
-    // ---- Optional: Google Custom Search snippets (for launch/used refs)
+    // Optional: Google Custom Search snippets
     let webSnippets = [];
     const CSE_KEY = process.env.CSE_KEY || HARD_CSE_KEY;
     const CSE_CX  = process.env.CSE_CX  || HARD_CSE_CX;
 
     if (wantWeb && CSE_KEY && CSE_CX) {
-      const qBase = [item?.brand, item?.model, item?.variant, "India price"].filter(Boolean).join(" ");
+      const qBase = [item?.brand, item?.model, item?.variant, "India price"]
+        .filter(Boolean).join(" ");
       const queries = [
         qBase,
         `${item?.brand || ""} ${item?.model || ""} launch price India`,
@@ -70,10 +86,7 @@ exports.handler = async (event) => {
       for (const q of queries) {
         try {
           const r = await fetch(
-            `https://www.googleapis.com/customsearch/v1` +
-            `?key=${encodeURIComponent(CSE_KEY)}` +
-            `&cx=${encodeURIComponent(CSE_CX)}` +
-            `&num=3&q=${encodeURIComponent(q)}`
+            `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(CSE_KEY)}&cx=${encodeURIComponent(CSE_CX)}&num=3&q=${encodeURIComponent(q)}`
           );
           if (r.ok) {
             const data = await r.json();
@@ -84,14 +97,14 @@ exports.handler = async (event) => {
               }))
             });
           }
-        } catch {/* ignore web failure */}
+        } catch { /* ignore */ }
       }
     }
 
-    // ---- Gemini call
     const GEMINI_API_KEY = process.env.GEMINI_API_KEY || HARD_GEMINI_KEY;
     if (!GEMINI_API_KEY) {
-      return { statusCode: 500, body: "Missing GEMINI_API_KEY" };
+      // Return error BUT with CORS headers so browser doesn’t show CORS failure
+      return respond(500, { error: "Missing GEMINI_API_KEY" }, origin);
     }
 
     // JSON schema (reportMd added)
@@ -151,27 +164,22 @@ Return JSON only → keys: priceBands, summary, reportMd, reasoningPoints, sourc
     };
 
     const resp = await fetch(`${GEMINI_ENDPOINT}?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
-      method: "POST", headers: { "content-type": "application/json" },
+      method: "POST",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(body)
     });
 
     if (!resp.ok) {
       const t = await resp.text();
-      return { statusCode: 502, body: `Gemini error: ${t}` };
+      // Still return CORS headers
+      return respond(502, { error: `Gemini error: ${t}` }, origin);
     }
 
     const data = await resp.json();
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+    return respond(200, text, origin, { "content-type": "application/json" });
 
-    return {
-      statusCode: 200,
-      headers: {
-        "content-type": "application/json",
-        "access-control-allow-origin": origin || "*"
-      },
-      body: text
-    };
   } catch (e) {
-    return { statusCode: 500, body: String(e?.message || e) };
+    return respond(500, { error: String(e?.message || e) }, origin);
   }
 };

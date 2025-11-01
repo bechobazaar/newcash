@@ -1,207 +1,158 @@
-// netlify/functions/price-advice.js
-// Node 18+ (Netlify): global fetch present. No extra deps needed.
+// netlify/functions/price-advisor.js
+// Node 18+ runtime
 
-// ─── CONFIG ─────────────────────────────────────────────────────────────
-const MODEL_ORDER = ["gemini-2.5-flash", "gemini-1.5-pro"];  // override by x-gemini-model
-// PROD me '*' mat rakho. Neeche client origin fill karo:
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*"; // e.g. "https://bechobazaar.com"
+const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
 
-// NOTE: Hardcoded key avoid karo; sirf emergency/dev ke liye:
-// set env: GEMINI_API_KEY in Netlify UI
-const GEMINI_KEY_FALLBACK = "AIzaSyD6Uvvth0RMC-I44K3vcan13JcSKPyIZrw"; // keep empty in prod
+/** ──────────────────────────────────────────────────────────────────────
+ *  CONFIG
+ *  Set env var: GEMINI_API_KEY in Netlify dashboard.
+ *  (Optional) You may override by sending header "x-gemini-key" from admin-only clients.
+ *  ────────────────────────────────────────────────────────────────────── */
+const MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+const GEMINI_ENDPOINT =
+  `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 
-// ─── small utils ────────────────────────────────────────────────────────
-const ok = (body, headers = {}) => ({
+const ok = (body, extraHeaders = {}) => ({
   statusCode: 200,
   headers: {
-    "content-type": "application/json",
-    "access-control-allow-origin": CORS_ORIGIN,
-    "access-control-allow-headers": "content-type,x-gemini-key,x-gemini-model",
-    "access-control-allow-methods": "POST,OPTIONS",
-    ...headers
+    "content-type": "application/json; charset=utf-8",
+    "access-control-allow-origin": "*",
+    "access-control-allow-headers": "content-type, x-gemini-key",
+    "access-control-allow-methods": "POST, OPTIONS",
+    ...extraHeaders
   },
-  body: typeof body === "string" ? body : JSON.stringify(body)
+  body: JSON.stringify(body)
 });
-const err = (code, msg, extra = {}) => ok({ error: msg, code, ...extra });
+const bad = (code, msg) => ({
+  statusCode: code,
+  headers: {
+    "content-type": "application/json; charset=utf-8",
+    "access-control-allow-origin": "*",
+    "access-control-allow-headers": "content-type, x-gemini-key",
+    "access-control-allow-methods": "POST, OPTIONS",
+  },
+  body: JSON.stringify({ error: msg })
+});
 
-const clampInt = (n) => {
-  const v = Math.round(Number(n));
-  return Number.isFinite(v) ? v : undefined;
-};
+exports.handler = async (ev) => {
+  if (ev.httpMethod === "OPTIONS") return ok({});
 
-const sanitizeBands = (bands = {}) => {
-  const out = {};
-  for (const k of ["quick","suggested","patient","median","p25","p75"]) {
-    const v = clampInt(bands[k]);
-    if (typeof v === "number") out[k] = v;
-  }
-  return out;
-};
+  if (ev.httpMethod !== "POST") return bad(405, "Use POST");
 
-const forceJSON = (t) => {
-  if (!t) return null;
-  try { return JSON.parse(t); } catch {}
-  const m = t.match(/```json\s*([\s\S]*?)```/i) || t.match(/```\s*([\s\S]*?)```/);
-  if (m?.[1]) { try { return JSON.parse(m[1]); } catch {} }
-  const i = t.indexOf("{"), j = t.lastIndexOf("}");
-  if (i !== -1 && j !== -1 && j > i) { try { return JSON.parse(t.slice(i, j + 1)); } catch {} }
-  return null;
-};
+  let key = ev.headers["x-gemini-key"] || process.env.GEMINI_API_KEY;
+  if (!key) return bad(401, "Missing GEMINI_API_KEY");
 
-const bandsFromAnchor = (p) => {
-  const n = Number(p || 0);
-  if (!Number.isFinite(n) || n <= 0) return null;
-  return {
-    quick: Math.round(n * 0.92),
-    suggested: Math.round(n),
-    patient: Math.round(n * 1.08),
-    median: Math.round(n),
-    p25: Math.round(n * 0.95),
-    p75: Math.round(n * 1.05)
-  };
-};
+  let payload;
+  try { payload = JSON.parse(ev.body || "{}"); }
+  catch { return bad(400, "Invalid JSON"); }
 
-const mkHeuristic = (item) => {
-  const place = [item?.area, item?.city, item?.state].filter(Boolean).join(", ");
-  return {
-    summary: "Heuristic preview (AI unavailable).",
-    priceBands: bandsFromAnchor(item?.price) || {},
-    marketNotes: "Limited comps; conservative ±8% band.",
-    localReality: place ? `Local demand considered for ${place}.` : "Locality unknown.",
-    factors: [
-      "Condition / age / battery health impacts ±5–12%",
-      "Original bill/box/warranty improves trust",
-      "Clear photos + honest defects convert faster"
-    ],
-    listingCopy: {
-      title: `${item?.brand || ""} ${item?.model || ""} — ${place}`.trim(),
-      descriptionShort: "Clean condition. All functions OK. Full bill/box. Serious buyers only."
-    },
-    postingStrategy: [
-      "Start near suggested; test first 48h.",
-      "Weak interest? Drop ₹1–2k after 48–72h.",
-      "Accept within band if leads are active."
-    ],
-    caveats: ["Heuristic only. Add more comps for sharper guidance."],
-    compsUsed: [],
-    sources: []
-  };
-};
+  const { item = {}, comps = [] } = payload;
 
-// ─── AI calls ───────────────────────────────────────────────────────────
-const callGemini = async (model, key, parts, timeoutMs = 12000) => {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
-  const body = {
-    contents: [{ role: "user", parts }],
-    generationConfig: { temperature: 0.2, topP: 0.9, maxOutputTokens: 1100 }
-  };
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-
-  try {
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-      signal: ctrl.signal
-    });
-    const text = await r.text();
-    return { ok: r.ok, status: r.status, text };
-  } finally {
-    clearTimeout(t);
-  }
-};
-
-const callWithFallback = async (models, key, parts) => {
-  const tries = [];
-  for (const m of models) {
-    const r = await callGemini(m, key, parts);
-    tries.push({ model: m, status: r.status, ok: r.ok, sample: r.text?.slice(0, 600) });
-    if (r.ok) {
-      let d; try { d = JSON.parse(r.text); } catch {}
-      const txt = d?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      return { success: true, model: m, txt, tries };
+  // Basic sanity
+  const must = ["category","brand","title","city","state"];
+  for (const m of must) {
+    if (!(item[m] && String(item[m]).trim())) {
+      return bad(400, `Missing item.${m}`);
     }
   }
-  return { success: false, tries };
-};
 
-// ─── Handler ────────────────────────────────────────────────────────────
-exports.handler = async (event) => {
-  if (event.httpMethod === "OPTIONS") return ok("");
-  if (event.httpMethod !== "POST")    return err(405, "Method Not Allowed");
+  // Compute market bands from comps (robust even if comps are few)
+  const prices = comps
+    .map(c => Number(c.price))
+    .filter(n => Number.isFinite(n) && n > 0)
+    .sort((a,b)=>a-b);
 
-  try {
-    // Basic input guards
-    const { item = {}, comps = [] } = JSON.parse(event.body || "{}");
+  const pct = (p) => {
+    if (!prices.length) return null;
+    const idx = (p/100) * (prices.length - 1);
+    const lo = Math.floor(idx), hi = Math.ceil(idx);
+    if (lo === hi) return prices[lo];
+    const t = idx - lo;
+    return prices[lo]*(1-t) + prices[hi]*t;
+  };
 
-    const headersLower = Object.fromEntries(
-      Object.entries(event.headers || {}).map(([k, v]) => [String(k).toLowerCase(), v])
-    );
-    const keyHeader = (headersLower["x-gemini-key"] || "").trim();
-    const KEY = keyHeader || (process.env.GEMINI_API_KEY || GEMINI_KEY_FALLBACK || "").trim();
-    const MODEL_HDR = (headersLower["x-gemini-model"] || "").trim();
+  const median = pct(50);
+  const p25    = pct(25);
+  const p75    = pct(75);
 
-    // Hard limits to avoid abuse
-    const compsSafe = Array.isArray(comps) ? comps.slice(0, 40) : [];
-    if (JSON.stringify(item).length > 12_000) return err(413, "item too large");
-    if (JSON.stringify(compsSafe).length > 40_000) return err(413, "comps too large");
+  // Suggested bands (fallback when comps are empty)
+  const quick     = median ? Math.round(median * 0.96) : (item.price ? Math.round(item.price*0.95) : null);
+  const suggested = median ? Math.round(median)        : (item.price || null);
+  const patient   = median ? Math.round(median * 1.05) : (item.price ? Math.round(item.price*1.05) : null);
 
-    // No key → heuristic response
-    if (!KEY) {
-      const fb = mkHeuristic(item);
-      return ok({ ...fb, debug: { usedAI: false, reason: "missing_key" } });
-    }
+  const priceBands = { quick, suggested, patient, median, p25, p75 };
 
-    const sys = `
-You are a pricing analyst for an Indian classifieds marketplace.
+  // Build compact comps digest for prompting (limit 30 to save tokens)
+  const topComps = comps.slice(0, 30).map(c => ({
+    price: c.price,
+    title: c.title?.slice(0, 80) || "",
+    brand: c.brand || "",
+    model: c.model || "",
+    city : c.city || "",
+    state: c.state || ""
+  }));
 
-Return JSON ONLY (no markdown). EXACT shape:
-{
-  "summary": "one paragraph",
-  "priceBands": { "quick":0, "suggested":0, "patient":0, "median":0, "p25":0, "p75":0 },
-  "marketNotes": "1–2 lines about India market context",
-  "localReality": "1–2 lines reflecting the user's city/region",
-  "factors": ["bullet points of why the price makes sense"],
-  "listingCopy": { "title": "", "descriptionShort": "" },
-  "postingStrategy": ["step 1","step 2","step 3"],
-  "caveats": ["short bullet caveats"],
-  "compsUsed": [{"title":"","price":0,"city":"","state":"","url":""}],
-  "sources": [{"title":"","link":""}]
-}
-Rules:
-- Prioritize provided COMPS; drop obvious outliers (>±40% from median where possible).
-- All numbers are INR whole integers.
-- If comps weak, derive cautious bands around user's anchor and add caveats.
-- Output ONLY valid JSON.
+  // Prompt
+  const sys = `
+You are a marketplace pricing analyst for a used-goods classifieds app in India.
+Write a tight, non-fluffy assessment the seller can read in 10–12 seconds.
+Tone: precise, confident, friendly. No marketing jargon. Avoid hallucination.
+If comps are few, say so clearly.
+Always output a one-paragraph summary and 3–5 bullet strategy points.
+Use Indian rupee style (e.g., ₹1,24,999). Avoid ranges like "10–50k" if not justified.
+Say if the entered price is Overpriced / Fair / Undervalued relative to comps.
 `.trim();
 
-    const parts = [
-      { text: sys },
-      { text: "ITEM:" },  { text: JSON.stringify(item || {}) },
-      { text: "COMPS:" }, { text: JSON.stringify(compsSafe || []) }
-    ];
+  // Format a small markdown block
+  const user = {
+    item,
+    priceBands,
+    comps: topComps
+  };
 
-    const list = MODEL_HDR ? [MODEL_HDR, ...MODEL_ORDER] : MODEL_ORDER;
-    const ai = await callWithFallback(list, KEY, parts);
-
-    if (!ai.success) {
-      const fb = mkHeuristic(item);
-      return ok({ ...fb, debug: { usedAI: false, tries: ai.tries } });
+  const reqBody = {
+    contents: [{
+      role: "user",
+      parts: [
+        { text: sys },
+        { text: "ITEM JSON:" },
+        { text: JSON.stringify(user, null, 2) },
+        { text: `
+Return JSON with keys:
+- summary (string, ≤ 60 words)
+- strategy (array of 3–5 short bullet strings)
+- caveats (array; empty if none)
+No markdown in JSON values. Keep it factual.
+`.trim() }
+      ]
+    }],
+    generationConfig: {
+      temperature: 0.3,
+      maxOutputTokens: 512
     }
+  };
 
-    const parsed = forceJSON(ai.txt);
-    if (!parsed || typeof parsed !== "object") {
-      const fb = mkHeuristic(item);
-      return ok({ ...fb, debug: { usedAI: true, parsedOK: false, model: ai.model } });
+  let aiJson = { summary: "", strategy: [], caveats: [] };
+  try {
+    const r = await fetch(`${GEMINI_ENDPOINT}?key=${encodeURIComponent(key)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(reqBody)
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      return ok({ priceBands, report: aiJson, caveats: [`Gemini API error: ${t}`], debug: { status: r.status, body: t } });
     }
-
-    // sanitize numeric bands
-    parsed.priceBands = sanitizeBands(parsed.priceBands);
-
-    return ok({ ...parsed, debug: { usedAI: true, parsedOK: true, model: ai.model } });
+    const data = await r.json();
+    const txt = data?.candidates?.[0]?.content?.parts?.map(p=>p.text).join("\n") || "{}";
+    // The model returns JSON string; parse safely
+    try { aiJson = JSON.parse(txt); } catch { aiJson = { summary: txt.slice(0, 400), strategy: [], caveats: ["Could not parse full JSON"] }; }
   } catch (e) {
-    // never leak stack in prod
-    return ok({ error: "internal_error", message: String(e?.message || e), debug: { usedAI: false } });
+    return ok({ priceBands, report: aiJson, caveats: [`Gemini call failed: ${String(e.message||e)}`] });
   }
+
+  return ok({
+    priceBands,
+    report: aiJson
+  });
 };

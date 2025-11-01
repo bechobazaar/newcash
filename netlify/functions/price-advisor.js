@@ -1,11 +1,13 @@
-// Node 18+ (default Netlify)
+// netlify/functions/price-advisor.js
+// Node 18+ on Netlify
+
 const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
 
-// ==== 🔑 API KEYS (server-side only; DO NOT put in frontend) ====
-const GEMINI_KEY = process.env.GEMINI_API_KEY || "AIzaSyD6Uvvth0RMC-I44K3vcan13JcSKPyIZrw"; // <— yahan apni key paste karein
-// (Optional) Google CSE for web snippets:
-const CSE_KEY   = process.env.CSE_KEY   || "";  // optional
-const CSE_CX    = process.env.CSE_CX    || "";  // optional
+// ====== KEYS (you can move to ENV later) ======
+const GEMINI_KEY = process.env.GEMINI_API_KEY || "AIzaSyD6Uvvth0RMC-I44K3vcan13JcSKPyIZrw";
+// Optional Google CSE for web snippets (leave blank if unused)
+const CSE_KEY = process.env.CSE_KEY || "";
+const CSE_CX  = process.env.CSE_CX  || "";
 
 const MODELS_TRY = ["gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-1.5-pro"];
 
@@ -13,7 +15,7 @@ const ok = (body, headers = {}) => ({
   statusCode: 200,
   headers: {
     "content-type": "application/json",
-    // 👇 Production में अपने domain पर lock कर दें
+    // For testing on netlify.app set "*" ; for prod lock to your domain:
     "access-control-allow-origin": "https://bechobazaar.com",
     "access-control-allow-headers": "content-type",
     "access-control-allow-methods": "POST, OPTIONS",
@@ -21,7 +23,6 @@ const ok = (body, headers = {}) => ({
   },
   body: typeof body === "string" ? body : JSON.stringify(body)
 });
-
 const err = (code, msg) => ok({ error: msg, code });
 
 function forceJSON(text) {
@@ -33,7 +34,6 @@ function forceJSON(text) {
   if (i !== -1 && j !== -1 && j > i) { try { return JSON.parse(text.slice(i, j + 1)); } catch {} }
   return null;
 }
-
 function fallbackFromAnchor(anchor) {
   const p = Number(anchor || 0);
   if (!Number.isFinite(p) || p <= 0) return null;
@@ -46,7 +46,6 @@ function fallbackFromAnchor(anchor) {
     p75: Math.round(p * 1.05)
   };
 }
-
 async function googleCSESnippets(qArr, key, cx) {
   if (!key || !cx) return [];
   const out = [];
@@ -65,10 +64,9 @@ async function googleCSESnippets(qArr, key, cx) {
   }
   return out;
 }
-
 async function callGeminiOnce(model, key, userParts) {
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-  const body = { contents: [{ role: "user", parts: userParts }], generationConfig: { temperature: 0.2, topP: 0.9, maxOutputTokens: 1200 } };
+  const body = { contents: [{ role: "user", parts: userParts }], generationConfig: { temperature: 0.25, topP: 0.9, maxOutputTokens: 1400 } };
   const r = await fetch(`${endpoint}?key=${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -77,12 +75,11 @@ async function callGeminiOnce(model, key, userParts) {
   const text = await r.text();
   return { ok: r.ok, status: r.status, text };
 }
-
 async function callGeminiWithFallback(models, key, userParts) {
   const tries = [];
   for (const m of models) {
     const res = await callGeminiOnce(m, key, userParts);
-    tries.push({ model: m, status: res.status, ok: res.ok, body: res.text.slice(0, 1200) });
+    tries.push({ model: m, status: res.status, ok: res.ok, body: res.text.slice(0, 1500) });
     if (res.ok) {
       let data; try { data = JSON.parse(res.text); } catch { data = null; }
       const txt = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
@@ -91,7 +88,6 @@ async function callGeminiWithFallback(models, key, userParts) {
   }
   return { success: false, model: null, txt: "", tries };
 }
-
 function mkHeuristicWriteup(item) {
   const anchor = Number(item?.price || 0) || 0;
   const b = fallbackFromAnchor(anchor) || {};
@@ -99,10 +95,10 @@ function mkHeuristicWriteup(item) {
   return {
     summary: "Heuristic preview based on entered details (AI unavailable).",
     priceBands: b,
-    marketNotes: "Limited signals; using cautious bands around your entered/typical price.",
+    marketNotes: "Limited signals; cautious bands around your entered/typical price.",
     localReality: place ? `Local demand considered for ${place}.` : "Local pool unknown; metro vs non-metro gap not applied.",
     factors: [
-      "Condition, age and storage drive variance (±5–12%).",
+      "Condition, age and storage variance (±5–12%).",
       "Full box + bill + warranty improves resale potential.",
       "Good photos + battery health proof raise trust."
     ],
@@ -128,7 +124,7 @@ exports.handler = async (event) => {
   try {
     const { item, comps = [], wantWeb = false } = JSON.parse(event.body || "{}");
 
-    // Optional web refs (if CSE configured)
+    // Optional web refs
     const queries = [
       [item?.brand, item?.model, item?.variant, "India price"].filter(Boolean).join(" "),
       `${item?.brand || ""} ${item?.model || ""} used price India`,
@@ -144,11 +140,10 @@ exports.handler = async (event) => {
     const sys = `
 You are a pricing analyst for an Indian classifieds marketplace.
 PRIORITIES:
-1) Use provided COMPS first; PUBLIC_SNIPPETS only as supporting signals.
+1) Use provided COMPS first; PUBLIC_SNIPPETS only as support.
 2) Trim outliers; consider condition/age/storage/region if derivable.
 3) Return INR whole integers.
-
-STRICT JSON ONLY with this shape:
+STRICT JSON ONLY:
 {
   "summary": "1 short paragraph",
   "priceBands": { "quick":0, "suggested":0, "patient":0, "median":0, "p25":0, "p75":0 },
@@ -156,12 +151,12 @@ STRICT JSON ONLY with this shape:
   "localReality": "1–2 lines about city/region nuance",
   "factors": ["bullets"],
   "listingCopy": { "title": "", "descriptionShort": "" },
-  "postingStrategy": ["step 1", "step 2", "step 3"],
+  "postingStrategy": ["step1","step2","step3"],
   "caveats": ["..."],
   "compsUsed": [{"title":"","price":0,"city":"","state":"","url":""}],
   "sources": [{"title":"","link":""}]
 }
-If evidence is weak, derive conservative bands around user's price and explain caveats. Output JSON only.`;
+If evidence is weak, create conservative bands around the user's price and explain caveats. Output JSON only.`;
 
     const userParts = [
       { text: sys.trim() },

@@ -1,13 +1,12 @@
 // netlify/functions/price-advisor.js
 // Node 18 runtime (global fetch available)
 
-// ---- If env vars aren't possible, keep a SERVER-SIDE fallback here.
-// DO NOT put this anywhere in frontend code or public repos.
-const HARD_GEMINI_KEY = "AIzaSyD6Uvvth0RMC-I44K3vcan13JcSKPyIZrw"; // <-- your key here
-const HARD_CSE_KEY    = ""; // optional
-const HARD_CSE_CX     = ""; // optional
+// ====== SERVER-ONLY KEYS (fallback) ======
+const HARD_GEMINI_KEY = "AIzaSyD6Uvvth0RMC-I44K3vcan13JcSKPyIZrw";  // <-- अपनी key भरो (frontend में कभी नहीं)
+const HARD_CSE_KEY    = ""; // optional (Google Custom Search)
+const HARD_CSE_CX     = ""; // optional (Google Custom Search CX id)
 
-// Allow only your domains to call this function
+// ====== Allow only your origins ======
 const ORIGIN_ALLOW = new Set([
   "https://bechobazaar.com",
   "https://www.bechobazaar.com",
@@ -15,17 +14,14 @@ const ORIGIN_ALLOW = new Set([
   "http://127.0.0.1:5500"
 ]);
 
-// Tiny in-memory rate limiter per function instance
-let __hits = 0;
-const MAX_HITS = 300;            // tune as needed per cold start instance
-const WINDOW_MS = 5 * 60 * 1000; // 5 min
-let __startedAt = Date.now();
+// ====== Basic in-memory rate-limit per instance ======
+let __hits = 0, __startedAt = Date.now();
+const MAX_HITS = 300, WINDOW_MS = 5*60*1000; // 5 min
 
 const GEMINI_ENDPOINT =
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent";
 
 exports.handler = async (event) => {
-  // --- CORS / Origin check
   const origin = event.headers.origin || event.headers.Origin || "";
   if (origin && !ORIGIN_ALLOW.has(origin)) {
     return { statusCode: 403, body: "Forbidden (origin)" };
@@ -47,25 +43,23 @@ exports.handler = async (event) => {
     return { statusCode: 405, body: "Method Not Allowed" };
   }
 
-  // --- simple rate-limit
+  // rate-limit
   const now = Date.now();
   if (now - __startedAt > WINDOW_MS) { __startedAt = now; __hits = 0; }
-  __hits++;
-  if (__hits > MAX_HITS) {
+  if (++__hits > MAX_HITS) {
     return { statusCode: 429, body: "Too Many Requests" };
   }
 
   try {
     const { item, comps, wantWeb = true } = JSON.parse(event.body || "{}");
 
-    // ---- (Optional) Google Custom Search snippets
+    // ---- Optional: Google Custom Search snippets (for launch/used refs)
     let webSnippets = [];
     const CSE_KEY = process.env.CSE_KEY || HARD_CSE_KEY;
     const CSE_CX  = process.env.CSE_CX  || HARD_CSE_CX;
 
     if (wantWeb && CSE_KEY && CSE_CX) {
-      const qBase = [item?.brand, item?.model, item?.variant, "India price"]
-        .filter(Boolean).join(" ");
+      const qBase = [item?.brand, item?.model, item?.variant, "India price"].filter(Boolean).join(" ");
       const queries = [
         qBase,
         `${item?.brand || ""} ${item?.model || ""} launch price India`,
@@ -74,7 +68,10 @@ exports.handler = async (event) => {
       for (const q of queries) {
         try {
           const r = await fetch(
-            `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(CSE_KEY)}&cx=${encodeURIComponent(CSE_CX)}&num=3&q=${encodeURIComponent(q)}`
+            `https://www.googleapis.com/customsearch/v1` +
+            `?key=${encodeURIComponent(CSE_KEY)}` +
+            `&cx=${encodeURIComponent(CSE_CX)}` +
+            `&num=3&q=${encodeURIComponent(q)}`
           );
           if (r.ok) {
             const data = await r.json();
@@ -85,20 +82,22 @@ exports.handler = async (event) => {
               }))
             });
           }
-        } catch {/* ignore */}
+        } catch {/* ignore web failure */}
       }
     }
 
-    // ---- Gemini
+    // ---- Gemini call
     const GEMINI_API_KEY = process.env.GEMINI_API_KEY || HARD_GEMINI_KEY;
     if (!GEMINI_API_KEY) {
       return { statusCode: 500, body: "Missing GEMINI_API_KEY" };
     }
 
+    // JSON schema (reportMd added)
     const schema = {
       type: "object",
       properties: {
         summary: { type: "string" },
+        reportMd: { type: "string" },
         priceBands: {
           type: "object",
           properties: {
@@ -122,8 +121,16 @@ exports.handler = async (event) => {
 
     const prompt =
 `You are a pricing analyst for an Indian classifieds marketplace.
-Use comps first; public snippets only as context. Trim outliers.
-Return INR whole numbers and three bands: quick/suggested/patient. JSON only.`;
+Use COMPARABLE_LISTINGS first; PUBLIC_SNIPPETS only as context.
+Trim outliers (approx 10–90 percentile band). Output INR whole numbers.
+
+Return three bands: quick / suggested / patient (+ median, p25, p75).
+Also write a human-friendly short report in Hinglish (markdown) with sections:
+- "Launch aur market reference" (1–2 bullets, cite snippets)
+- "Aapki specific item details" (bullets using item fields, positive assumptions clear)
+- "Suggested selling price" (3 bullet lines)
+- "Why this estimate" (2–4 bullets)
+Return JSON only → keys: priceBands, summary, reportMd, reasoningPoints, sources.`;
 
     const body = {
       contents: [{
@@ -136,14 +143,13 @@ Return INR whole numbers and three bands: quick/suggested/patient. JSON only.`;
         ]
       }],
       generationConfig: {
-        temperature: 0.2, topP: 0.9, maxOutputTokens: 1024,
+        temperature: 0.2, topP: 0.9, maxOutputTokens: 1400,
         responseMimeType: "application/json", responseSchema: schema
       }
     };
 
     const resp = await fetch(`${GEMINI_ENDPOINT}?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
+      method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify(body)
     });
 

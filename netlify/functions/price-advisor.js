@@ -10,9 +10,11 @@ const HARD_CSE_CX     = ""; // optional (Google Custom Search CX id)
 const ORIGIN_ALLOW = new Set([
   "https://bechobazaar.com",
   "https://www.bechobazaar.com",
+  "https://bechobazaar.netlify.app",
   "http://localhost:8888",
   "http://127.0.0.1:5500"
 ]);
+
 
 // ====== Basic in-memory rate-limit per instance ======
 let __hits = 0, __startedAt = Date.now();

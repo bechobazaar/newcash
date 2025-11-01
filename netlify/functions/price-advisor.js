@@ -3,18 +3,16 @@
 const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
 
 // === Keys (server-side only) ===
-// (You asked to inline; still prefer env in production.)
+// (You asked to inline; keep in ENV for production security.)
 const GEMINI_KEY = process.env.GEMINI_API_KEY || "AIzaSyD6Uvvth0RMC-I44K3vcan13JcSKPyIZrw";
 
-// v1beta endpoint models that work today
+// Models that work on v1beta generateContent:
 const MODELS_TRY = ["gemini-2.5-flash", "gemini-1.5-pro"];
 
-// ---------- helpers ----------
 const ok = (body, headers = {}) => ({
   statusCode: 200,
   headers: {
     "content-type": "application/json",
-    // lock to your domain (add preview domains if needed)
     "access-control-allow-origin": "https://bechobazaar.com",
     "access-control-allow-headers": "content-type,x-gemini-key,x-gemini-model",
     "access-control-allow-methods": "POST,OPTIONS",
@@ -28,18 +26,18 @@ function forceJSON(t) {
   if (!t) return null;
   const s = String(t).trim();
 
-  // Prefer explicit wrapper: <json> ... </json>
+  // Preferred: <json> ... </json>
   const tag = s.match(/<json>\s*([\s\S]*?)\s*<\/json>/i);
-  if (tag?.[1]) {
-    try { return JSON.parse(tag[1].trim()); } catch {}
-  }
+  if (tag?.[1]) { try { return JSON.parse(tag[1].trim()); } catch {} }
 
-  // Fallbacks: fenced or first {...} block
+  // Fenced ```json
   const fence = s.match(/```json\s*([\s\S]*?)```/i) || s.match(/```\s*([\s\S]*?)```/i);
   if (fence?.[1]) { try { return JSON.parse(fence[1].trim()); } catch {} }
 
+  // First {...} block
   const i = s.indexOf("{"), j = s.lastIndexOf("}");
   if (i !== -1 && j !== -1 && j > i) { try { return JSON.parse(s.slice(i, j + 1)); } catch {} }
+
   return null;
 }
 
@@ -102,7 +100,7 @@ async function callWithFallback(models, key, parts) {
   const tries = [];
   for (const m of models) {
     const res = await callGemini(m, key, parts);
-    tries.push({ model: m, status: res.status, ok: res.ok, body: res.text.slice(0, 1000) });
+    tries.push({ model: m, status: res.status, ok: res.ok, body: res.text.slice(0, 1200) });
     if (res.ok) {
       let d; try { d = JSON.parse(res.text); } catch {}
       const txt = d?.candidates?.[0]?.content?.parts?.[0]?.text || "";
@@ -112,25 +110,57 @@ async function callWithFallback(models, key, parts) {
   return { success: false, tries };
 }
 
-// ---------- handler ----------
+// Second-pass coercion: convert any text into strict JSON wrapped in <json>…</json>
+async function coerceToJSON(model, key, rawText) {
+  const sys = `
+You will be given a previous assistant message. Convert it to EXACT JSON following this schema and wrap it in <json>...</json>.
+If a field can't be inferred, provide a safe default.
+
+Schema:
+{
+  "summary": "one paragraph",
+  "priceBands": { "quick":0, "suggested":0, "patient":0, "median":0, "p25":0, "p75":0 },
+  "marketNotes": "string",
+  "localReality": "string",
+  "factors": ["string"],
+  "listingCopy": { "title":"", "descriptionShort":"" },
+  "postingStrategy": ["string"],
+  "caveats": ["string"],
+  "compsUsed": [{"title":"","price":0,"city":"","state":"","url":""}],
+  "sources": [{"title":"","link":""}]
+}
+
+Reply with ONLY <json>{...}</json>. Do not add any extra text.
+`.trim();
+
+  const parts = [
+    { text: sys },
+    { text: "PREVIOUS_ASSISTANT_TEXT:" },
+    { text: String(rawText || "") },
+    { text: "Remember: ONLY <json>{...}</json>." }
+  ];
+
+  const r = await callGemini(model, key, parts);
+  if (!r.ok) return { ok: false, status: r.status, text: r.text };
+  return { ok: true, status: r.status, text: r.text };
+}
+
 exports.handler = async (event) => {
   if (event.httpMethod === "OPTIONS") return ok("");
   if (event.httpMethod !== "POST")   return err(405, "Method Not Allowed");
 
   try {
     const { item, comps = [] } = JSON.parse(event.body || "{}");
-    const hdr = Object.fromEntries(
-      Object.entries(event.headers || {}).map(([k, v]) => [k.toLowerCase(), v])
-    );
+    const hdr = Object.fromEntries(Object.entries(event.headers || {}).map(([k, v]) => [k.toLowerCase(), v]));
     const KEY = hdr["x-gemini-key"] || GEMINI_KEY;
-    const OVERRIDE_MODEL = hdr["x-gemini-model"]; // optional override
+    const OVERRIDE_MODEL = hdr["x-gemini-model"];
 
     if (!KEY) {
       const fb = mkHeuristic(item);
       return ok({ ...fb, debug: { usedAI: false, reason: "missing_key" } });
     }
 
-    // Strong JSON-only instruction with explicit wrapper
+    // Strong JSON-only instruction (first pass)
     const sys = `
 You are a pricing analyst for an Indian classifieds marketplace.
 
@@ -174,10 +204,21 @@ Rules:
       return ok({ ...fb, debug: { usedAI: false, tries: ai.tries } });
     }
 
-    const parsed = forceJSON(ai.txt);
-    if (!parsed || typeof parsed !== "object") {
+    // Try to parse first-pass text
+    let parsed = forceJSON(ai.txt);
+    let usedModel = ai.model;
+    let parsedOK = !!parsed;
+
+    // If not parsed, do a coercion pass (same model)
+    if (!parsedOK) {
+      const coer = await coerceToJSON(usedModel, KEY, ai.txt);
+      if (coer.ok) parsed = forceJSON(coer.text);
+      parsedOK = !!parsed;
+    }
+
+    if (!parsedOK || typeof parsed !== "object") {
       const fb = mkHeuristic(item);
-      return ok({ ...fb, debug: { usedAI: true, parsedOK: false } });
+      return ok({ ...fb, debug: { usedAI: true, parsedOK: false, model: usedModel, note: "coercion_failed_or_empty" } });
     }
 
     // sanitize numeric bands
@@ -200,7 +241,7 @@ Rules:
       caveats: parsed.caveats || [],
       compsUsed: Array.isArray(parsed.compsUsed) ? parsed.compsUsed.slice(0, 20) : [],
       sources: Array.isArray(parsed.sources) ? parsed.sources.slice(0, 20) : [],
-      debug: { usedAI: true, parsedOK: true, model: ai.model }
+      debug: { usedAI: true, parsedOK: true, model: usedModel }
     });
 
   } catch (e) {

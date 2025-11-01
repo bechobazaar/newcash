@@ -163,7 +163,7 @@ exports.handler = async (event) => {
 };
 
 
-    const prompt =
+   const prompt =
 `You are a pricing analyst for an Indian classifieds marketplace.
 Use COMPARABLE_LISTINGS first; PUBLIC_SNIPPETS only as context.
 Trim outliers (approx 10–90 percentile band). Output INR whole numbers.
@@ -174,7 +174,17 @@ Also write a human-friendly short report in Hinglish (markdown) with sections:
 - "Aapki specific item details" (bullets using item fields, positive assumptions clear)
 - "Suggested selling price" (3 bullet lines)
 - "Why this estimate" (2–4 bullets)
-Return JSON only → keys: priceBands, summary, reportMd, reasoningPoints, sources.`;
+
+In JSON, include:
+- priceBands
+- summary
+- reportMd
+- reasoningPoints (bullets)
+- compsUsed: array of objects with {title, price, brand, model, city, state, postedAt, url}
+- sources: array of {title, link, snippet}
+
+Return JSON only (no prose outside JSON).`;
+
 
     const body = {
       contents: [{

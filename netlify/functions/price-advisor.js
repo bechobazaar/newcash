@@ -14,7 +14,7 @@ const ORIGIN_ALLOW = new Set([
   "http://127.0.0.1:5500",
 ]);
 
-// Gemini v1 endpoints (use one)
+// Gemini v1 endpoint (pick one)
 const GEMINI_ENDPOINT =
   "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent";
 // Cheaper option:
@@ -43,6 +43,24 @@ function respond(statusCode, body, origin, extra = {}) {
     headers: { ...corsHeaders(origin), ...extra },
     body: typeof body === "string" ? body : JSON.stringify(body),
   };
+}
+
+function tryParseJsonFromText(text) {
+  if (!text) return null;
+  // 1) direct
+  try { return JSON.parse(text); } catch {}
+  // 2) fenced code block
+  const m = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (m) {
+    try { return JSON.parse(m[1]); } catch {}
+  }
+  // 3) first { ... } block
+  const i = text.indexOf("{");
+  const j = text.lastIndexOf("}");
+  if (i >= 0 && j > i) {
+    try { return JSON.parse(text.slice(i, j + 1)); } catch {}
+  }
+  return null;
 }
 
 // ============= HANDLER =============
@@ -122,79 +140,23 @@ exports.handler = async (event) => {
       return respond(500, { error: "Missing GEMINI_API_KEY" }, origin);
     }
 
-    // Response schema (IMPORTANT: non-empty object properties)
-    const schema = {
-      type: "object",
-      properties: {
-        summary: { type: "string" },
-        reportMd: { type: "string" },
-        priceBands: {
-          type: "object",
-          properties: {
-            quick: { type: "number" },
-            suggested: { type: "number" },
-            patient: { type: "number" },
-            median: { type: "number" },
-            p25: { type: "number" },
-            p75: { type: "number" },
-          },
-          required: ["suggested"],
-        },
-        reasoningPoints: { type: "array", items: { type: "string" } },
-        compsUsed: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              title: { type: "string" },
-              price: { type: "number" },
-              brand: { type: "string" },
-              model: { type: "string" },
-              city: { type: "string" },
-              state: { type: "string" },
-              postedAt: { type: "string" }, // ISO string or text
-              url: { type: "string" },
-            },
-            required: ["title", "price"],
-          },
-        },
-        caveats: { type: "array", items: { type: "string" } },
-        sources: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              title: { type: "string" },
-              link: { type: "string" },
-              snippet: { type: "string" },
-            },
-            required: ["title"],
-          },
-        },
-      },
-      required: ["priceBands", "summary"],
-    };
-
+    // Prompt-only JSON contract (no schema keys)
     const prompt = `You are a pricing analyst for an Indian classifieds marketplace.
-Use COMPARABLE_LISTINGS first; PUBLIC_SNIPPETS only as context.
-Trim outliers (approx 10–90 percentile band). Output INR whole numbers only.
+Use COMPARABLE_LISTINGS first; PUBLIC_SNIPPETS only as context. Trim outliers (approx 10–90 percentile).
+Output INR whole numbers only.
 
-Return three bands: quick / suggested / patient (+ median, p25, p75).
-Also write a short human-friendly report in Hinglish (markdown) with sections:
-- "Launch aur market reference" (1–2 bullets, cite snippets where useful)
-- "Aapki specific item details" (bullets using item fields; call out assumptions)
-- "Suggested selling price" (3 bullet lines with INR)
-- "Why this estimate" (2–4 bullets)
+Return a STRICT JSON object with keys:
+- "priceBands": { "quick": number, "suggested": number, "patient": number, "median": number, "p25": number, "p75": number }
+- "summary": string
+- "reportMd": string (Hinglish markdown with sections: "Launch aur market reference", "Aapki specific item details", "Suggested selling price", "Why this estimate")
+- "reasoningPoints": string[] (2–6 bullets)
+- "compsUsed": array of { "title": string, "price": number, "brand": string, "model": string, "city": string, "state": string, "postedAt": string, "url": string }
+- "sources": array of { "title": string, "link": string, "snippet": string }
 
-In JSON, include:
-- priceBands
-- summary
-- reportMd
-- reasoningPoints (bullets)
-- compsUsed: array of {title, price, brand, model, city, state, postedAt, url}
-- sources: array of {title, link, snippet}
-
-Return JSON only (no prose outside JSON).`;
+Constraints:
+- ONLY return JSON. No extra commentary.
+- Prices must be integers in INR (no decimals or currency words).
+- If unsure about a field, omit it rather than guessing wildly.`;
 
     const body = {
       contents: [
@@ -215,9 +177,7 @@ Return JSON only (no prose outside JSON).`;
         temperature: 0.2,
         topP: 0.9,
         maxOutputTokens: 1400,
-        // v1 expects camelCase:
-        responseMimeType: "application/json",
-        responseSchema: schema,
+        // IMPORTANT: Do NOT send responseSchema/responseMimeType for v1 here.
       },
     };
 
@@ -236,10 +196,15 @@ Return JSON only (no prose outside JSON).`;
     }
 
     const data = await resp.json();
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
-    // Return the model JSON as-is
-    return respond(200, text, origin, { "content-type": "application/json" });
+    // Try to parse JSON from the text (handles code fences too)
+    const parsed = tryParseJsonFromText(text);
+    if (!parsed) {
+      return respond(502, { error: "AI returned non-JSON or unparsable JSON", raw: text }, origin);
+    }
+
+    return respond(200, parsed, origin, { "content-type": "application/json" });
   } catch (e) {
     return respond(500, { error: String(e?.message || e) }, origin);
   }

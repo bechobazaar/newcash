@@ -215,9 +215,9 @@ Return JSON only (no prose outside JSON).`;
         temperature: 0.2,
         topP: 0.9,
         maxOutputTokens: 1400,
-        // NOTE: v1 uses snake_case for these keys:
-        response_mime_type: "application/json",
-        response_schema: schema,
+        // v1 expects camelCase:
+        responseMimeType: "application/json",
+        responseSchema: schema,
       },
     };
 

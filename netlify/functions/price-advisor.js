@@ -1,27 +1,52 @@
 // netlify/functions/price-advisor.js
-// CORS + Gemini + (optional) Google CSE snippets
 
-const GEMINI_ENDPOINT =
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent";
+const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
-// ---- tiny helpers ----
-function corsHeaders(origin) {
-  return {
-    "Access-Control-Allow-Origin": origin || "*",
-    "Access-Control-Allow-Methods": "POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-Gemini-Key",
-    "Access-Control-Max-Age": "86400",
-    "Content-Type": "application/json",
-  };
+const MODEL = "gemini-1.5-flash"; // v1beta generateContent supported
+const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+
+// ---- small utils
+const ok = (body, headers={}) => ({
+  statusCode: 200,
+  headers: {
+    "content-type": "application/json",
+    // CORS (both your domains)
+    "access-control-allow-origin": "*", // or set to "https://bechobazaar.com"
+    "access-control-allow-headers": "content-type,x-gemini-key,x-cse-key,x-cse-cx",
+    "access-control-allow-methods": "POST, OPTIONS",
+    ...headers
+  },
+  body: (typeof body === "string" ? body : JSON.stringify(body))
+});
+
+const err = (code, msg) => ok({ error: msg, code });
+
+// robust JSON extractor (handles fenced blocks, trailing text, etc.)
+function forceJSON(text) {
+  if (!text) return null;
+  // try direct
+  try { return JSON.parse(text); } catch(_) {}
+
+  // pick first ```json ... ``` block
+  const m = text.match(/```json\s*([\s\S]*?)```/i) || text.match(/```\s*([\s\S]*?)```/);
+  if (m && m[1]) {
+    try { return JSON.parse(m[1]); } catch(_) {}
+  }
+  // find first { ... } balanced (simple fallback)
+  const i = text.indexOf('{');
+  const j = text.lastIndexOf('}');
+  if (i !== -1 && j !== -1 && j > i) {
+    const slice = text.slice(i, j + 1);
+    try { return JSON.parse(slice); } catch(_) {}
+  }
+  return null;
 }
 
-// safe number
-const toNum = (x) => (Number.isFinite(Number(x)) ? Number(x) : 0);
-
-// basic heuristic bands (when no data)
-function fallbackBands(seedPrice) {
-  const p = Math.max(1, toNum(seedPrice) || 1);
-  return {
+// very light fallback bands if AI not available
+function fallbackFromAnchor(anchor) {
+  const p = Number(anchor || 0);
+  if (!Number.isFinite(p) || p <= 0) return null;
+  const bands = {
     quick: Math.round(p * 0.92),
     suggested: Math.round(p),
     patient: Math.round(p * 1.08),
@@ -29,225 +54,179 @@ function fallbackBands(seedPrice) {
     p25: Math.round(p * 0.95),
     p75: Math.round(p * 1.05),
   };
+  return bands;
+}
+
+async function googleCSESnippets(qArr, key, cx) {
+  const out = [];
+  for (const q of qArr) {
+    try {
+      const r = await fetch(
+        `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(key)}&cx=${encodeURIComponent(cx)}&num=3&q=${encodeURIComponent(q)}`
+      );
+      if (!r.ok) continue;
+      const data = await r.json();
+      out.push({
+        query: q,
+        items: (data.items || []).map(it => ({
+          title: it.title, link: it.link, snippet: it.snippet
+        }))
+      });
+    } catch {}
+  }
+  return out;
 }
 
 exports.handler = async (event) => {
-  const origin = event.headers?.origin || "*";
-
-  // ---- CORS preflight
   if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 200, headers: corsHeaders(origin), body: "" };
+    return ok(""); // CORS preflight
   }
-
   if (event.httpMethod !== "POST") {
-    return {
-      statusCode: 405,
-      headers: corsHeaders(origin),
-      body: JSON.stringify({ error: "Method Not Allowed" }),
-    };
+    return err(405, "Method Not Allowed");
   }
 
   try {
-    const { item = {}, comps = [], wantWeb = false } = JSON.parse(event.body || "{}");
+    const { item, comps = [], wantWeb = false } = JSON.parse(event.body || "{}");
 
-    // --------- (Optional) Google Custom Search snippets ----------
+    // pull keys from env or headers (headers win)
+    const hdr = event.headers || {};
+    const GEMINI_API_KEY = hdr["x-gemini-key"] || process.env.GEMINI_API_KEY || "";
+    const CSE_KEY = hdr["x-cse-key"] || process.env.CSE_KEY || "";
+    const CSE_CX  = hdr["x-cse-cx"]  || process.env.CSE_CX  || "";
+
+    // optional web snippets
     let webSnippets = [];
-    const CSE_KEY = process.env.CSE_KEY;
-    const CSE_CX = process.env.CSE_CX;
-
     if (wantWeb && CSE_KEY && CSE_CX) {
-      const qBase = [item.brand, item.model, item.category, "India price"]
-        .filter(Boolean)
-        .join(" ");
+      const qBase = [item?.brand, item?.model, item?.variant, "India price"].filter(Boolean).join(" ");
       const queries = [
         qBase,
-        `${item.brand || ""} ${item.model || ""} second hand price India`,
-        `${item.brand || ""} ${item.model || ""} used price in ${item.city || ""} ${item.state || ""}`,
-      ];
-      for (const q of queries) {
-        try {
-          const r = await fetch(
-            `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(
-              CSE_KEY
-            )}&cx=${encodeURIComponent(CSE_CX)}&num=3&q=${encodeURIComponent(q)}`
-          );
-          if (r.ok) {
-            const data = await r.json();
-            webSnippets.push({
-              query: q,
-              items: (data.items || []).map((it) => ({
-                title: it.title,
-                link: it.link,
-                snippet: it.snippet,
-              })),
-            });
-          }
-        } catch {}
-      }
+        `${item?.brand || ""} ${item?.model || ""} used price India`,
+        `${item?.brand || ""} ${item?.model || ""} resale value India`,
+      ].filter(Boolean);
+      webSnippets = await googleCSESnippets(queries, CSE_KEY, CSE_CX);
     }
 
-    // ---------- Gemini ----------
-    // You can supply API key in three ways (priority order):
-    //  1) netlify env var GEMINI_API_KEY
-    //  2) secret header X-Gemini-Key (from your frontend or Postman)
-    //  3) (NOT RECOMMENDED) hardcoded fallback string below
-    const hdrKey = event.headers?.["x-gemini-key"] || event.headers?.["X-Gemini-Key"];
-    const GEMINI_API_KEY =
-      process.env.GEMINI_API_KEY ||
-      hdrKey ||
-      ""; // keep empty here; DO NOT hardcode public keys
-
+    // If no key, return heuristic
     if (!GEMINI_API_KEY) {
-      // Still respond with safe fallback so UI shows something
-      const bands = fallbackBands(item.price);
-      return {
-        statusCode: 200,
-        headers: corsHeaders(origin),
-        body: JSON.stringify({
-          summary:
-            "AI key missing on server. Showing heuristic based on your entered price. Add GEMINI_API_KEY or send X-Gemini-Key header.",
-          priceBands: bands,
-          caveats: [
-            "This is a heuristic preview. Configure GEMINI_API_KEY on Netlify for AI analysis.",
-          ],
-          compsUsed: comps.slice(0, 8),
-          sources: webSnippets,
-          debug: { reason: "missing_gemini_key" },
-        }),
-      };
+      const fb = fallbackFromAnchor(item?.price);
+      return ok({
+        summary: "AI key missing on server. Showing heuristic based on your entered price. Add GEMINI_API_KEY (or send X-Gemini-Key header).",
+        priceBands: fb || {},
+        caveats: ["This is a heuristic preview. Configure Gemini for AI analysis."],
+        compsUsed: comps.slice(0, 10),
+        sources: webSnippets,
+        debug: { usedAI: false, reason: "missing_key" }
+      });
     }
 
-    const prompt = [
-      "You are a pricing analyst for an Indian classifieds marketplace.",
-      "Input includes the item, comparable listings (from our DB), and optional public web snippets.",
-      "Task:",
-      "- Use comps first; ignore obvious outliers.",
-      "- Consider city/state and India market only.",
-      "- Derive INR whole-number price bands: quick (lower), suggested (mid), patient (higher).",
-      "- Also compute percentile-ish anchors (median, p25, p75) if possible.",
-      "- If comps are empty, base ranges on the given price but state that it’s heuristic.",
-      "Output strictly JSON with keys:",
-      "{ summary: string, priceBands: { quick, suggested, patient, median, p25, p75 },",
-      "  reasoning: string[], caveats: string[], sources: object[] }",
-      "No extra prose outside JSON.",
-    ].join("\n");
+    // Build strict prompt (return JSON only)
+    const sys = `
+You are a pricing analyst for an Indian classifieds marketplace.
+TASK: Use provided comparables ("COMPS") first; use "PUBLIC_SNIPPETS" only as supporting signals.
+Trim outliers, reason about condition/age/region if possible from titles/text.
+Return INR whole numbers. Return three core bands: quick, suggested, patient. Also include median, p25, p75 if derivable.
+Return STRICT JSON ONLY with this shape:
+
+{
+  "summary": "one-paragraph summary",
+  "priceBands": { "quick": 0, "suggested": 0, "patient": 0, "median": 0, "p25": 0, "p75": 0 },
+  "reasoningPoints": ["short bullets..."],
+  "compsUsed": [{"title":"","price":0,"city":"","state":"","url":""}],
+  "caveats": ["..."],
+  "sources": [{"title":"","link":""}]
+}
+
+If not enough evidence, still produce bands using a conservative heuristic around the user's price, and add a clear caveat.
+Numbers must be integers (no commas). Do not include any text outside JSON.
+`;
+
+    const userParts = [
+      { text: sys.trim() },
+      { text: "ITEM:" },
+      { text: JSON.stringify(item || {}) },
+      { text: "COMPS:" },
+      { text: JSON.stringify(comps || []) },
+      { text: "PUBLIC_SNIPPETS:" },
+      { text: JSON.stringify(webSnippets || []) }
+    ];
 
     const body = {
-      contents: [
-        {
-          role: "user",
-          parts: [
-            { text: prompt },
-            { text: "ITEM_JSON:\n" + JSON.stringify(item || {}) },
-            { text: "COMPARABLE_LISTINGS_JSON:\n" + JSON.stringify(comps || []) },
-            { text: "PUBLIC_SNIPPETS_JSON:\n" + JSON.stringify(webSnippets || []) },
-          ],
-        },
-      ],
+      contents: [{ role: "user", parts: userParts }],
       generationConfig: {
         temperature: 0.2,
         topP: 0.9,
-        maxOutputTokens: 1024,
-      },
+        maxOutputTokens: 1024
+      }
     };
 
-    const resp = await fetch(
-      `${GEMINI_ENDPOINT}?key=${encodeURIComponent(GEMINI_API_KEY)}`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      }
-    );
+    const resp = await fetch(`${GEMINI_ENDPOINT}?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
 
     if (!resp.ok) {
       const t = await resp.text();
-      // Return graceful fallback so UI doesn’t break
-      return {
-        statusCode: 200,
-        headers: corsHeaders(origin),
-        body: JSON.stringify({
-          summary:
-            "No structured AI output received. Using a conservative heuristic around your entered price.",
-          priceBands: fallbackBands(item.price),
-          caveats: [
-            "AI call failed; check model name, quota, or API key.",
-            `Upstream: ${t.slice(0, 200)}...`,
-          ],
-          compsUsed: comps.slice(0, 8),
-          sources: webSnippets,
-          debug: { reason: "gemini_call_failed" },
-        }),
-      };
+      // fallback bands if API error
+      const fb = fallbackFromAnchor(item?.price);
+      return ok({
+        summary: "Gemini error; using heuristic fallback.",
+        priceBands: fb || {},
+        caveats: ["Heuristic because AI call failed.", t.slice(0, 300)],
+        compsUsed: comps.slice(0, 10),
+        sources: webSnippets,
+        debug: { usedAI: false, reason: "gemini_http_error", http: t }
+      });
     }
 
     const data = await resp.json();
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      parsed = null;
-    }
-
+    let parsed = forceJSON(text);
     if (!parsed || typeof parsed !== "object") {
-      return {
-        statusCode: 200,
-        headers: corsHeaders(origin),
-        body: JSON.stringify({
-          summary:
-            "No structured AI output; returning heuristic bands based on your entered price.",
-          priceBands: fallbackBands(item.price),
-          caveats: ["AI returned non-JSON output."],
-          compsUsed: comps.slice(0, 8),
-          sources: webSnippets,
-          debug: { reason: "ai_non_json" },
-        }),
-      };
+      const fb = fallbackFromAnchor(item?.price);
+      return ok({
+        summary: "No structured AI output received. Using a conservative heuristic around your entered price.",
+        priceBands: fb || {},
+        caveats: ["AI replied without strict JSON. Prompt enforcer engaged; showing fallback bands."],
+        compsUsed: comps.slice(0, 10),
+        sources: webSnippets,
+        debug: { usedAI: true, parsedOK: false, rawLen: text?.length || 0 }
+      });
     }
 
-    // sanitize bands
-    const pb = parsed.priceBands || {};
-    const safeBands = {
-      quick: toNum(pb.quick) || undefined,
-      suggested: toNum(pb.suggested) || toNum(item.price) || undefined,
-      patient: toNum(pb.patient) || undefined,
-      median: toNum(pb.median) || toNum(item.price) || undefined,
-      p25: toNum(pb.p25) || undefined,
-      p75: toNum(pb.p75) || undefined,
-    };
+    // sanitize numeric fields to integers
+    if (parsed.priceBands && typeof parsed.priceBands === "object") {
+      for (const k of ["quick","suggested","patient","median","p25","p75"]) {
+        if (parsed.priceBands[k] != null) {
+          const n = Number(parsed.priceBands[k]);
+          if (Number.isFinite(n)) parsed.priceBands[k] = Math.round(n);
+          else delete parsed.priceBands[k];
+        }
+      }
+    }
 
-    const out = {
+    return ok({
       summary: parsed.summary || "",
-      priceBands: safeBands,
-      reasoning: Array.isArray(parsed.reasoning) ? parsed.reasoning : [],
-      caveats: Array.isArray(parsed.caveats) ? parsed.caveats : [],
-      sources: Array.isArray(parsed.sources) ? parsed.sources : [],
-      compsUsed: (Array.isArray(comps) ? comps : []).slice(0, 25),
-      debug: { model: "gemini-1.5-flash", haveWeb: !!(CSE_KEY && CSE_CX && wantWeb) },
-    };
+      priceBands: parsed.priceBands || {},
+      reasoning: parsed.reasoningPoints || [],
+      caveats: parsed.caveats || [],
+      compsUsed: Array.isArray(parsed.compsUsed) ? parsed.compsUsed.slice(0, 20) : [],
+      sources: Array.isArray(parsed.sources) ? parsed.sources.slice(0, 20) : [],
+      debug: { usedAI: true, parsedOK: true }
+    });
 
-    // fill minimal when bands missing
-    if (!out.priceBands.suggested) out.priceBands = fallbackBands(item.price);
-
-    return {
-      statusCode: 200,
-      headers: corsHeaders(origin),
-      body: JSON.stringify(out),
-    };
   } catch (e) {
-    return {
-      statusCode: 200,
-      headers: corsHeaders(origin),
-      body: JSON.stringify({
-        summary: "Server error; using heuristic bands.",
-        priceBands: fallbackBands( Number(JSON.parse(event.body||"{}")?.item?.price || 0) ),
-        caveats: ["Internal function error: " + (e?.message || e)],
-        compsUsed: [],
-        sources: [],
-        debug: { reason: "server_exception" },
-      }),
-    };
+    const fb = fallbackFromAnchor(
+      (() => { try { return JSON.parse(event.body||"{}")?.item?.price } catch { return 0; }})()
+    );
+    return ok({
+      summary: "Server error; showing heuristic fallback.",
+      priceBands: fb || {},
+      caveats: ["Heuristic because server crashed.", String(e?.message || e)],
+      compsUsed: [],
+      sources: [],
+      debug: { usedAI: false, reason: "exception" }
+    });
   }
 };

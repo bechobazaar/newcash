@@ -1,4 +1,5 @@
 // netlify/functions/price-advisor-web.js
+// Works with Chat Completions + json_schema. CORS included.
 
 const ok = (body, headers = {}) => ({
   statusCode: 200,
@@ -48,7 +49,7 @@ exports.handler = async (event) => {
       return bad(400, "Missing required fields (category, brand, city, state)");
     }
 
-    // ── Optional Tavily web search ─────────────────────────────────────────────
+    // ── Optional Tavily web search (best-effort) ─────────────────────────────
     let web = { used: false, answer: "", results: [] };
     if (TAVILY_KEY) {
       try {
@@ -81,15 +82,15 @@ exports.handler = async (event) => {
       }
     }
 
-    // ── System prompt + JSON schema ───────────────────────────────────────────
+    // ── Prompt & schema for JSON output ──────────────────────────────────────
     const sys =
       "You are an Indian marketplace price advisor. Estimate used-market band and a realistic quick-sale price in INR. " +
-      "Consider condition, storage/variant, bill/box, battery health for phones, and regional demand. " +
+      "Consider condition, storage/variant, bill/box, battery health (phones), and regional demand. " +
       "Return strictly the requested JSON schema. Also include a short HTML paragraph 'webview_summary_html' (2–4 sentences) " +
       "that reads like a web-browse result (bold model + city, market band, recommended ask, brief reasons). " +
       "If web_results exist, ground your paragraph and add 2–4 sources (title + url).";
 
-    const schema = {
+    const jsonSchema = {
       name: "PriceAdvice",
       schema: {
         type: "object",
@@ -137,12 +138,12 @@ exports.handler = async (event) => {
       top_sources: topSources
     };
 
-    // ── Model choice via header ───────────────────────────────────────────────
-    const plan  = (event.headers["x-plan"] || event.headers["X-Plan"] || "free").toString().toLowerCase();
+    // Pick model
+    const plan      = (event.headers["x-plan"] || event.headers["X-Plan"] || "free").toString().toLowerCase();
     const modelName = plan === "pro" ? "gpt-5-mini" : "gpt-4o-mini";
 
-    // ── OpenAI Responses API (CORRECT SHAPE) ─────────────────────────────────
-    const aiRes = await fetch("https://api.openai.com/v1/responses", {
+    // ── Chat Completions with JSON Schema ────────────────────────────────────
+    const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -150,30 +151,21 @@ exports.handler = async (event) => {
       },
       body: JSON.stringify({
         model: modelName,
-        input: [
-          { role: "system", content: [{ type: "input_text", text: sys }] },
-          {
-            role: "user",
-            content: [
-              {
-                type: "input_text",
-                text: JSON.stringify({ task: "estimate_used_price_india", user_input: userCtx })
-              }
-            ]
-          }
+        messages: [
+          { role: "system", content: sys },
+          { role: "user", content: JSON.stringify({ task: "estimate_used_price_india", user_input: userCtx }) }
         ],
-        response_format: { type: "json_schema", json_schema: schema },
-        max_output_tokens: 900
+        response_format: { type: "json_schema", json_schema: jsonSchema },
+        max_tokens: 900
       })
     });
 
     if (!aiRes.ok) {
-      // return the raw OpenAI error for visibility
       return bad(400, `OpenAI error: ${await aiRes.text()}`);
     }
 
     const aiJson = await aiRes.json();
-    const raw = aiJson?.output_text || "";
+    const raw = aiJson?.choices?.[0]?.message?.content || "";
     let parsed = {};
     try { parsed = JSON.parse(raw); } catch { parsed = {}; }
 

@@ -1,5 +1,5 @@
 // netlify/functions/price-advisor-web.js
-// Works with Chat Completions + json_schema. CORS included.
+// Uses OpenAI Responses API with json_schema (correct param names)
 
 const ok = (body, headers = {}) => ({
   statusCode: 200,
@@ -49,7 +49,7 @@ exports.handler = async (event) => {
       return bad(400, "Missing required fields (category, brand, city, state)");
     }
 
-    // ── Optional Tavily web search (best-effort) ─────────────────────────────
+    // ── Optional Tavily web search ───────────────────────────────────────────
     let web = { used: false, answer: "", results: [] };
     if (TAVILY_KEY) {
       try {
@@ -77,12 +77,10 @@ exports.handler = async (event) => {
               content: r.content || "",
             }))
           : [];
-      } catch {
-        web = { used: false, answer: "", results: [] };
-      }
+      } catch { /* ignore */ }
     }
 
-    // ── Prompt & schema for JSON output ──────────────────────────────────────
+    // ── System prompt + JSON schema ──────────────────────────────────────────
     const sys =
       "You are an Indian marketplace price advisor. Estimate used-market band and a realistic quick-sale price in INR. " +
       "Consider condition, storage/variant, bill/box, battery health (phones), and regional demand. " +
@@ -138,12 +136,12 @@ exports.handler = async (event) => {
       top_sources: topSources
     };
 
-    // Pick model
-    const plan      = (event.headers["x-plan"] || event.headers["X-Plan"] || "free").toString().toLowerCase();
+    // plan → model
+    const plan = (event.headers["x-plan"] || event.headers["X-Plan"] || "free").toString().toLowerCase();
     const modelName = plan === "pro" ? "gpt-5-mini" : "gpt-4o-mini";
 
-    // ── Chat Completions with JSON Schema ────────────────────────────────────
-    const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+    // ── ✅ OpenAI Responses API (correct payload) ────────────────────────────
+    const aiRes = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -151,12 +149,12 @@ exports.handler = async (event) => {
       },
       body: JSON.stringify({
         model: modelName,
-        messages: [
-          { role: "system", content: sys },
-          { role: "user", content: JSON.stringify({ task: "estimate_used_price_india", user_input: userCtx }) }
+        input: [
+          { role: "system", content: [{ type: "input_text", text: sys }] },
+          { role: "user",   content: [{ type: "input_text", text: JSON.stringify({ task: "estimate_used_price_india", user_input: userCtx }) }] }
         ],
         response_format: { type: "json_schema", json_schema: jsonSchema },
-        max_tokens: 900
+        max_output_tokens: 900
       })
     });
 
@@ -165,9 +163,9 @@ exports.handler = async (event) => {
     }
 
     const aiJson = await aiRes.json();
-    const raw = aiJson?.choices?.[0]?.message?.content || "";
+    const raw = aiJson?.output_text || "";
     let parsed = {};
-    try { parsed = JSON.parse(raw); } catch { parsed = {}; }
+    try { parsed = JSON.parse(raw); } catch {}
 
     // ── Post-fixes / safety ──────────────────────────────────────────────────
     const ensureBand = (obj) => {

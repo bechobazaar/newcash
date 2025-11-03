@@ -1,5 +1,5 @@
 // netlify/functions/price-advisor-web.js
-// Uses OpenAI Responses API with json_schema (correct param names)
+// OpenAI Responses API (instructions + input) + optional Tavily grounding
 
 const ok = (body, headers = {}) => ({
   statusCode: 200,
@@ -29,14 +29,14 @@ const bad = (statusCode, msg) => ({
 });
 
 exports.handler = async (event) => {
+  if (event.httpMethod === "OPTIONS") return ok("");
+  if (event.httpMethod !== "POST") return bad(405, "POST only");
+
+  const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
+  const TAVILY_KEY = process.env.TAVILY_API_KEY || ""; // optional
+  if (!OPENAI_KEY) return bad(400, "Missing OPENAI_API_KEY");
+
   try {
-    if (event.httpMethod === "OPTIONS") return ok("");
-    if (event.httpMethod !== "POST") return bad(405, "POST only");
-
-    const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
-    const TAVILY_KEY = process.env.TAVILY_API_KEY || "";
-    if (!OPENAI_KEY) return bad(400, "Missing OPENAI_API_KEY");
-
     const { input = {} } = JSON.parse(event.body || "{}");
     const category = (input.category || "").trim();
     const brand    = (input.brand || "").trim();
@@ -49,7 +49,7 @@ exports.handler = async (event) => {
       return bad(400, "Missing required fields (category, brand, city, state)");
     }
 
-    // ── Optional Tavily web search ───────────────────────────────────────────
+    // ── Optional: Tavily grounding ──────────────────────────────────────────
     let web = { used: false, answer: "", results: [] };
     if (TAVILY_KEY) {
       try {
@@ -58,7 +58,7 @@ exports.handler = async (event) => {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
             api_key: TAVILY_KEY,
-            query: `Used price and recent listing range for ${brand} ${model || category} in ${city}, ${state}, India.`,
+            query: `Used price and recent listings for ${brand} ${model || category} in ${city}, ${state}, India.`,
             search_depth: "advanced",
             max_results: 8,
             include_answer: true,
@@ -77,16 +77,16 @@ exports.handler = async (event) => {
               content: r.content || "",
             }))
           : [];
-      } catch { /* ignore */ }
+      } catch { /* ignore, stay graceful */ }
     }
 
-    // ── System prompt + JSON schema ──────────────────────────────────────────
-    const sys =
-      "You are an Indian marketplace price advisor. Estimate used-market band and a realistic quick-sale price in INR. " +
-      "Consider condition, storage/variant, bill/box, battery health (phones), and regional demand. " +
-      "Return strictly the requested JSON schema. Also include a short HTML paragraph 'webview_summary_html' (2–4 sentences) " +
-      "that reads like a web-browse result (bold model + city, market band, recommended ask, brief reasons). " +
-      "If web_results exist, ground your paragraph and add 2–4 sources (title + url).";
+    // ── System guidance & JSON schema ───────────────────────────────────────
+    const instructions =
+      "You are an Indian marketplace price advisor. Estimate a used-market band and a realistic quick-sale price in INR (numbers only). " +
+      "Consider item condition, storage/variant, bill/box availability, battery-health for phones, and local demand. " +
+      "Return STRICTLY the requested JSON schema. Also include a short HTML paragraph 'webview_summary_html' (2–4 sentences) " +
+      "like a web-browse result: bold model + city, current market range, recommended ask, and brief reasons. " +
+      "If web_results exist, ground your paragraph and include 2–4 sources (title + url).";
 
     const jsonSchema = {
       name: "PriceAdvice",
@@ -140,34 +140,37 @@ exports.handler = async (event) => {
     const plan = (event.headers["x-plan"] || event.headers["X-Plan"] || "free").toString().toLowerCase();
     const modelName = plan === "pro" ? "gpt-5-mini" : "gpt-4o-mini";
 
-    // ── ✅ OpenAI Responses API (correct payload) ────────────────────────────
+    // ── ✅ OpenAI Responses API (simple payload) ────────────────────────────
+    const payload = {
+      model: modelName,
+      // put the “system” in `instructions`
+      instructions,
+      // put the user data as one string in `input`
+      input: JSON.stringify({ task: "estimate_used_price_india", user_input: userCtx }),
+      response_format: { type: "json_schema", json_schema: jsonSchema },
+      max_output_tokens: 900
+    };
+
     const aiRes = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "authorization": `Bearer ${OPENAI_KEY}`,
+        authorization: `Bearer ${OPENAI_KEY}`,
       },
-      body: JSON.stringify({
-        model: modelName,
-        input: [
-          { role: "system", content: [{ type: "input_text", text: sys }] },
-          { role: "user",   content: [{ type: "input_text", text: JSON.stringify({ task: "estimate_used_price_india", user_input: userCtx }) }] }
-        ],
-        response_format: { type: "json_schema", json_schema: jsonSchema },
-        max_output_tokens: 900
-      })
+      body: JSON.stringify(payload)
     });
 
     if (!aiRes.ok) {
-      return bad(400, `OpenAI error: ${await aiRes.text()}`);
+      const txt = await aiRes.text();
+      return bad(400, `OpenAI error: ${txt}`);
     }
 
     const aiJson = await aiRes.json();
     const raw = aiJson?.output_text || "";
     let parsed = {};
-    try { parsed = JSON.parse(raw); } catch {}
+    try { parsed = JSON.parse(raw); } catch { parsed = {}; }
 
-    // ── Post-fixes / safety ──────────────────────────────────────────────────
+    // ── Post-fixes / sanity ─────────────────────────────────────────────────
     const ensureBand = (obj) => {
       let lo = Number(obj.market_price_low || 0);
       let hi = Number(obj.market_price_high || 0);

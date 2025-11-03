@@ -1,5 +1,5 @@
 // netlify/functions/price-advisor-web.js
-// OpenAI Responses API (instructions + input) + optional Tavily grounding
+// Works without response_format; parses JSON from model text output.
 
 const ok = (body, headers = {}) => ({
   statusCode: 200,
@@ -28,6 +28,23 @@ const bad = (statusCode, msg) => ({
   body: JSON.stringify({ error: msg }),
 });
 
+// naive JSON extractor from a text blob
+function extractJsonBlock(s = "") {
+  // Try the whole string first
+  try { return JSON.parse(s); } catch {}
+  // Then try the largest {...} block
+  const m = s.match(/\{[\s\S]*\}$/);
+  if (m) {
+    try { return JSON.parse(m[0]); } catch {}
+  }
+  // Then try any JSON-looking block
+  const all = s.match(/\{[\s\S]*?\}/g) || [];
+  for (const cand of all) {
+    try { return JSON.parse(cand); } catch {}
+  }
+  return null;
+}
+
 exports.handler = async (event) => {
   if (event.httpMethod === "OPTIONS") return ok("");
   if (event.httpMethod !== "POST") return bad(405, "POST only");
@@ -49,7 +66,7 @@ exports.handler = async (event) => {
       return bad(400, "Missing required fields (category, brand, city, state)");
     }
 
-    // ── Optional: Tavily grounding ──────────────────────────────────────────
+    // ── Optional web grounding via Tavily ─────────────────────────────
     let web = { used: false, answer: "", results: [] };
     if (TAVILY_KEY) {
       try {
@@ -77,78 +94,52 @@ exports.handler = async (event) => {
               content: r.content || "",
             }))
           : [];
-      } catch { /* ignore, stay graceful */ }
+      } catch { /* ignore */ }
     }
 
-    // ── System guidance & JSON schema ───────────────────────────────────────
-    const instructions =
-      "You are an Indian marketplace price advisor. Estimate a used-market band and a realistic quick-sale price in INR (numbers only). " +
-      "Consider item condition, storage/variant, bill/box availability, battery-health for phones, and local demand. " +
-      "Return STRICTLY the requested JSON schema. Also include a short HTML paragraph 'webview_summary_html' (2–4 sentences) " +
-      "like a web-browse result: bold model + city, current market range, recommended ask, and brief reasons. " +
-      "If web_results exist, ground your paragraph and include 2–4 sources (title + url).";
-
-    const jsonSchema = {
-      name: "PriceAdvice",
-      schema: {
-        type: "object",
-        additionalProperties: true,
-        properties: {
-          market_price_low:  { type: "number" },
-          market_price_high: { type: "number" },
-          suggested_price:   { type: "number" },
-          confidence:        { type: "string", enum: ["low", "medium", "high"] },
-          old_vs_new: {
-            type: "object",
-            additionalProperties: false,
-            properties: {
-              launch_mrp:   { type: "number" },
-              typical_used: { type: "number" }
-            }
-          },
-          why: { type: "string" },
-          webview_summary_html: { type: "string" },
-          sources: {
-            type: "array",
-            items: {
-              type: "object",
-              additionalProperties: false,
-              properties: {
-                title: { type: "string" },
-                url:   { type: "string" }
-              }
-            }
-          }
-        },
-        required: ["market_price_low", "market_price_high", "suggested_price", "confidence"]
-      },
-      strict: true
-    };
-
     const topSources = (web.results || []).slice(0, 4).map(r => ({ title: r.title, url: r.url }));
+
+    const instructions =
+`Return ONLY JSON. No prose, no code fences.
+Schema:
+{
+  "market_price_low": number,
+  "market_price_high": number,
+  "suggested_price": number,
+  "confidence": "low" | "medium" | "high",
+  "old_vs_new": { "launch_mrp"?: number, "typical_used"?: number },
+  "why"?: string,
+  "webview_summary_html"?: string,
+  "sources"?: [{ "title": string, "url": string }]
+}
+
+You are an Indian marketplace price advisor. Estimate a used-market band and a realistic quick-sale price in INR (plain numbers).
+Consider condition, storage/variant, bill/box availability, battery health for phones, and local demand.
+Write 'webview_summary_html' as a short 2–4 sentence HTML paragraph like a web-browse result: start with bold model + city, state, then market range + recommended ask + brief reasons.
+If web_results are present, ground the paragraph to them and include 2–4 sources (title + url). If none, keep sources empty.`;
+
     const userCtx = {
-      category, brand, model,
+      category,
+      brand,
+      model,
       region: [city, state].filter(Boolean).join(", "),
       input_price: price,
       web_used: web.used,
       web_answer: web.answer,
       web_results: web.results,
-      top_sources: topSources
+      top_sources: topSources,
     };
 
-    // plan → model
     const plan = (event.headers["x-plan"] || event.headers["X-Plan"] || "free").toString().toLowerCase();
     const modelName = plan === "pro" ? "gpt-5-mini" : "gpt-4o-mini";
 
-    // ── ✅ OpenAI Responses API (simple payload) ────────────────────────────
+    // Keep payload minimal for widest compatibility
     const payload = {
       model: modelName,
-      // put the “system” in `instructions`
       instructions,
-      // put the user data as one string in `input`
-      input: JSON.stringify({ task: "estimate_used_price_india", user_input: userCtx }),
-      response_format: { type: "json_schema", json_schema: jsonSchema },
-      max_output_tokens: 900
+      input: JSON.stringify(userCtx),
+      max_output_tokens: 900,
+      // temperature left default
     };
 
     const aiRes = await fetch("https://api.openai.com/v1/responses", {
@@ -157,7 +148,7 @@ exports.handler = async (event) => {
         "content-type": "application/json",
         authorization: `Bearer ${OPENAI_KEY}`,
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
     });
 
     if (!aiRes.ok) {
@@ -167,10 +158,9 @@ exports.handler = async (event) => {
 
     const aiJson = await aiRes.json();
     const raw = aiJson?.output_text || "";
-    let parsed = {};
-    try { parsed = JSON.parse(raw); } catch { parsed = {}; }
+    let parsed = extractJsonBlock(raw) || {};
 
-    // ── Post-fixes / sanity ─────────────────────────────────────────────────
+    // ── Post-fixes / sanity guards ───────────────────────────────────
     const ensureBand = (obj) => {
       let lo = Number(obj.market_price_low || 0);
       let hi = Number(obj.market_price_high || 0);
@@ -189,10 +179,16 @@ exports.handler = async (event) => {
         ? s.trim()
         : `<p><b>${brand} ${model || category}, ${city}:</b> Pricing estimated from typical India used-market trends for this category and region. List near the mid of the range for a faster sale.</p>`;
 
+    // adopt sources if present, else use Tavily topSources
+    const finalSources = Array.isArray(parsed?.sources) && parsed.sources.length
+      ? parsed.sources.slice(0, 4)
+      : topSources;
+
     const result = ensureBand({
       ...parsed,
       webview_summary_html: safeSummary(parsed?.webview_summary_html),
-      sources: Array.isArray(parsed?.sources) ? parsed.sources.slice(0, 4) : topSources
+      sources: finalSources,
+      confidence: (parsed?.confidence || "medium"),
     });
 
     return ok({ ok: true, provider: "openai", model: modelName, result });

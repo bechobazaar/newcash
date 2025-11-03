@@ -2,9 +2,9 @@
 // Node 18+ (Netlify). Dynamic import for node-fetch.
 const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
 
-/** =========================
- *  Utility helpers
- *  ========================= */
+/* ─────────────────────────────────────────
+   Small utilities
+─────────────────────────────────────────── */
 const ok = (body, event) => ({
   statusCode: 200,
   headers: cors(event),
@@ -27,17 +27,20 @@ function cors(event) {
     'Content-Type': 'application/json; charset=utf-8',
   };
 }
-
 function safeParseJSON(s) { try { return JSON.parse(s); } catch { return null; } }
-
-function num(n, def = 0) {
-  const x = Number(n);
-  return Number.isFinite(x) ? x : def;
+function num(n, def = 0) { const x = Number(n); return Number.isFinite(x) ? x : def; }
+function clip(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
+function fmtINR(n) {
+  const s = Math.round(Number(n) || 0).toString();
+  if (s.length <= 3) return s;
+  const last3 = s.slice(-3);
+  const other = s.slice(0, -3).replace(/\B(?=(\d{2})+(?!\d))/g, ',');
+  return other + ',' + last3;
 }
-function clip(n, lo, hi) {
-  return Math.min(hi, Math.max(lo, n));
-}
 
+/* ─────────────────────────────────────────
+   Input normalization
+─────────────────────────────────────────── */
 function normalizeInput(raw = {}) {
   const clean = (v) => (v == null ? '' : String(v).toString().trim());
   const out = {
@@ -51,30 +54,28 @@ function normalizeInput(raw = {}) {
     city: clean(raw.city),
     area: clean(raw.area),
     price: num(raw.price, 0),
-    condition: clean(raw.condition),    // may be auto-extracted client-side
+    condition: clean(raw.condition),    // may be auto-extracted on client
     billBox: !!raw.billBox,
     age: clean(raw.age || raw.ageOrYear),
     kmDriven: clean(raw.kmDriven),
   };
-  // sanity caps
   if (out.price < 0) out.price = 0;
   if (out.price > 2e8) out.price = 2e8;
   return out;
 }
 
-/** Heuristic fallback when OpenAI fails.
- *  Light depreciation + condition factor → band
- */
-function fallbackHeuristic(i) {
-  // Baseline MRP guess if unknown model:
+/* ─────────────────────────────────────────
+   Heuristic fallback (when OpenAI fails)
+─────────────────────────────────────────── */
+function fallbackHeuristic(i = {}) {
+  // Baseline MRP guess
   let baseMrp = 100000;
-  // quick special-case hints (you can expand)
-  const key = `${i.brand} ${i.model}`.toLowerCase();
+  const key = `${i.brand || ''} ${i.model || ''}`.toLowerCase();
   if (key.includes('s24') && key.includes('ultra')) baseMrp = 88000;
   if (key.includes('iphone 15')) baseMrp = 70000;
 
   // condition factor
-  const c = i.condition.toLowerCase();
+  const c = (i.condition || '').toLowerCase();
   let factor = 0.70;
   if (/new|sealed/.test(c)) factor = 1.00;
   else if (/like new|excellent|mint|scratchless/.test(c)) factor = 0.85;
@@ -83,12 +84,11 @@ function fallbackHeuristic(i) {
   else if (/fair|used/.test(c)) factor = 0.60;
   else if (/poor|broken|crack|damaged/.test(c)) factor = 0.45;
 
-  // age adjustment (months/years in string)
+  // age factor (~1.5%/month decay up to 24m)
   let ageFactor = 1.0;
-  const m = i.age.match?.(/(\d+)\s*(month|months|yr|year|years?)/i);
+  const m = i.age && i.age.match(/(\d+)\s*(month|months|yr|year|years?)/i);
   if (m) {
     const n = Number(m[1] || 0);
-    // simple decay ~1.5% per month up to 24m
     const months = /month/.test(m[2]) ? n : n * 12;
     ageFactor = clip(1 - 0.015 * clip(months, 0, 24), 0.6, 1.0);
   }
@@ -100,31 +100,23 @@ function fallbackHeuristic(i) {
   const low = Math.round(mid * 0.92);
   const high = Math.round(mid * 1.08);
   const suggest = Math.round((low + high) / 2);
-  // quick/patience anchors
   const quick = Math.round(low * 0.98);
   const patience = Math.round(high * 1.07);
 
-  const refs = {
-    launch: `Approx new/launch reference around ₹${fmtINR(baseMrp)} for this variant (estimated).`,
-    used: `Used market (heuristic): like-new items often listed in ₹${fmtINR(low)}–₹${fmtINR(high)} range.`,
+  return {
+    refs: {
+      launch: `Approx new/launch reference around ₹${fmtINR(baseMrp)} for this variant (estimated).`,
+      used: `Used market (heuristic): like-new items often listed in ₹${fmtINR(low)}–₹${fmtINR(high)} range.`,
+    },
+    band: { low, high, suggest, quick, patience },
   };
-
-  return { refs, band: { low, high, suggest, quick, patience } };
 }
 
-function fmtINR(n) {
-  const s = Math.round(Number(n) || 0).toString();
-  if (s.length <= 3) return s;
-  const last3 = s.slice(-3);
-  const other = s.slice(0, -3).replace(/\B(?=(\d{2})+(?!\d))/g, ',');
-  return other + ',' + last3;
-}
-
-/** Parse OpenAI Responses payload into our JSON shape. */
+/* ─────────────────────────────────────────
+   Coerce OpenAI outputs → final shape
+─────────────────────────────────────────── */
 function coerceOpenAIToBand(json) {
-  // Expected: { refs:{launch,used}, band:{low,high,suggest,quick,patience} }
   if (!json || typeof json !== 'object') return null;
-
   const bandSrc = json.band || json.priceBand || {};
   const out = {
     refs: {
@@ -140,7 +132,7 @@ function coerceOpenAIToBand(json) {
     },
   };
 
-  // If low/high missing but text exists, try extracting "₹xx to ₹yy"
+  // If missing low/high but text exists, attempt parse from text
   if ((!out.band.low || !out.band.high) && (json.html || json.text || json.markdown)) {
     const s = String(json.html || json.text || json.markdown);
     const m = s.match(/₹?\s?([\d,]+)\s*(?:to|-|–)\s*₹?\s?([\d,]+)/i);
@@ -155,16 +147,15 @@ function coerceOpenAIToBand(json) {
     }
   }
 
-  // Validate presence
   if (!out.band.low || !out.band.high) return null;
   return out;
 }
 
-/** =========================
- *  Main handler
- *  ========================= */
+/* ─────────────────────────────────────────
+   Main handler
+─────────────────────────────────────────── */
 exports.handler = async (event) => {
-  // Preflight / health
+  // Preflight + health
   if (event.httpMethod === 'OPTIONS') return { statusCode: 200, headers: cors(event), body: '' };
   if (event.httpMethod === 'GET') return ok({ ok: true, name: 'price-advisor-web' }, event);
 
@@ -175,7 +166,6 @@ exports.handler = async (event) => {
 
     const input = normalizeInput(inputRaw);
 
-    // Build compact instruction for JSON response
     const prompt = `
 You are a pricing advisor for Indian C2C classifieds. Return STRICT JSON ONLY:
 {
@@ -187,74 +177,109 @@ brand=${input.brand}, model=${input.model}, category=${input.category}, subCateg
 condition=${input.condition}, billBox=${input.billBox}, age=${input.age}, kmDriven=${input.kmDriven},
 city=${input.city}, state=${input.state}, userPrice=${input.price}.
 Numbers must be Indian INR (no commas in JSON numbers). Keep refs short, factual.
-`;
+`.trim();
 
-    const MODEL = event.headers['x-openai-model'] || 'gpt-4.1-mini';
     const OPENAI_KEY = process.env.OPENAI_API_KEY;
-
-    // If API key missing → immediate heuristic fallback
+    const MODEL_PRIMARY = event.headers['x-openai-model'] || 'gpt-4.1-mini';
     if (!OPENAI_KEY) {
       const fb = fallbackHeuristic(input);
+      fb.warning = 'OPENAI_API_KEY missing → heuristic';
       return ok(fb, event);
     }
 
-    // Responses API call with timeout
+    // ===== OpenAI call (Responses → plain string JSON mode) with Chat fallback
+    async function callOpenAIResponses(promptStr, signal) {
+      const r = await fetch('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${OPENAI_KEY}`,
+        },
+        body: JSON.stringify({
+          model: MODEL_PRIMARY,
+          input: promptStr,                 // IMPORTANT: a plain string
+          response_format: { type: 'json_object' },
+        }),
+        signal,
+      });
+
+      if (!r.ok) {
+        const text = await r.text().catch(()=>'');
+        const err = new Error('responses_api_error');
+        err.payload = text;
+        throw err;
+      }
+
+      const data = await r.json();
+      return (
+        safeParseJSON(data.output_text) ||
+        safeParseJSON(data?.output?.[0]?.content?.[0]?.text) ||
+        (typeof data === 'object' && data.json ? data.json : null)
+      );
+    }
+
+    async function callOpenAIChat(promptStr, signal) {
+      const chatModel = 'gpt-4o-mini';
+      const r = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${OPENAI_KEY}`,
+        },
+        body: JSON.stringify({
+          model: chatModel,
+          response_format: { type: 'json_object' },
+          messages: [
+            { role: 'system', content: 'Return JSON only. No markdown.' },
+            { role: 'user', content: promptStr },
+          ],
+        }),
+        signal,
+      });
+
+      if (!r.ok) {
+        const text = await r.text().catch(()=>'');
+        const err = new Error('chat_api_error');
+        err.payload = text;
+        throw err;
+      }
+
+      const data = await r.json();
+      const txt = data.choices?.[0]?.message?.content || '';
+      return safeParseJSON(txt);
+    }
+
+    // Timeout + fallbacks
     const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 16000); // 16s safety
+    const to = setTimeout(() => ctrl.abort(), 16000);
+    let candidate = null;
 
-    const r = await fetch('https://api.openai.com/v1/responses', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${OPENAI_KEY}`,
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        reasoning: { effort: 'low' },
-        input: [
-          { role: 'system', content: 'Return JSON only. No markdown.' },
-          { role: 'user', content: prompt },
-        ],
-        response_format: { type: 'json_object' },
-      }),
-      signal: ctrl.signal,
-    }).catch((e) => {
-      throw new Error('OpenAI fetch failed: ' + e.message);
-    });
-    clearTimeout(to);
-
-    if (!r.ok) {
-      // OpenAI error → heuristic fallback but include diagnostic
-      const text = await r.text().catch(() => '');
-      const fb = fallbackHeuristic(input);
-      fb.error = 'OpenAI error';
-      fb.detail = text.slice(0, 900);
-      return ok(fb, event);
+    try {
+      candidate = await callOpenAIResponses(prompt, ctrl.signal);
+    } catch (e1) {
+      try {
+        candidate = await callOpenAIChat(prompt, ctrl.signal);
+      } catch (e2) {
+        const fb = fallbackHeuristic(input);
+        fb.error = 'OpenAI error';
+        fb.detail = (e1 && e1.payload ? e1.payload : String(e1)).slice(0, 900);
+        clearTimeout(to);
+        // Try coercing if candidate has something, else fallback object
+        return ok(coerceOpenAIToBand(candidate) || fb, event);
+      }
+    } finally {
+      clearTimeout(to);
     }
 
-    const data = await r.json();
-
-    // Try multiple shapes from Responses API
-    let candidate =
-      safeParseJSON(data.output_text) ||
-      safeParseJSON(data?.output?.[0]?.content?.[0]?.text) ||
-      (typeof data === 'object' && data.json ? data.json : null) ||
-      null;
-
-    // If we got an object but not in our final shape, try coercion
-    let final = coerceOpenAIToBand(candidate);
-
-    // No luck? one more attempt: the entire "data" might already match
-    if (!final) final = coerceOpenAIToBand(data);
-
-    // Still no luck → fallback
+    // Coerce to final shape or fallback
+    let final = coerceOpenAIToBand(candidate) || coerceOpenAIToBand({ json: candidate });
     if (!final) {
       const fb = fallbackHeuristic(input);
       fb.warning = 'AI parse fallback';
       return ok(fb, event);
     }
 
-    // Clamp sanity
+    // Sanity clamp
     const L = final.band.low, H = final.band.high;
     if (!(L > 0 && H > 0 && H >= L)) {
       const fb = fallbackHeuristic(input);
@@ -264,7 +289,6 @@ Numbers must be Indian INR (no commas in JSON numbers). Keep refs short, factual
 
     return ok(final, event);
   } catch (e) {
-    // Total failure → fallback + error echo
     const input = (() => {
       try { return normalizeInput((safeParseJSON(event.body || '{}') || {}).input); } catch { return {}; }
     })();

@@ -1,6 +1,6 @@
 // netlify/functions/price-advisor-web.js
 
-// ---------- CORS helpers ----------
+// ---------- CORS ----------
 const CORS = {
   "content-type": "application/json; charset=utf-8",
   "access-control-allow-origin": "*",
@@ -22,39 +22,29 @@ const bad = (statusCode, msg) => ({
   body: JSON.stringify({ error: msg }),
 });
 
-// Optional: tiny timeout wrapper so upstream calls don't hang forever
 const withTimeout = (p, ms = 25000, label = "request") => {
   let t;
-  const timeout = new Promise((_, rej) => {
-    t = setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms);
-  });
+  const timeout = new Promise((_, rej) =>
+    (t = setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms))
+  );
   return Promise.race([p, timeout]).finally(() => clearTimeout(t));
 };
 
 exports.handler = async (event) => {
-  // ✅ Proper preflight
   if (event.httpMethod === "OPTIONS") {
     return { statusCode: 204, headers: CORS, body: "" };
   }
+  if (event.httpMethod !== "POST") return bad(405, "POST only");
 
-  if (event.httpMethod !== "POST") {
-    return bad(405, "POST only");
-  }
-
-  // ---- ENV KEYS ----
   const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
-  const TAVILY_KEY = process.env.TAVILY_API_KEY || ""; // optional
-
-  if (!OPENAI_KEY) {
-    return bad(400, "Server missing OPENAI_API_KEY");
-  }
+  const TAVILY_KEY = process.env.TAVILY_API_KEY || "";
+  if (!OPENAI_KEY) return bad(400, "Server missing OPENAI_API_KEY");
 
   try {
-    // ---- Parse input ----
     const { input = {} } = JSON.parse(event.body || "{}");
     const category = (input.category || "").trim();
     const brand = (input.brand || "").trim();
-    const model = (input.model || "").trim();
+    const deviceModel = (input.model || "").trim();          // <— renamed
     const city = (input.city || "").trim();
     const state = (input.state || "").trim();
     const price = Number(input.price || 0) || 0;
@@ -63,12 +53,12 @@ exports.handler = async (event) => {
       return bad(400, "Missing required fields (category, brand, city, state)");
     }
 
-    // ---- 1) Tavily grounded search (optional) ----
+    // ---- 1) Tavily (optional) ----
     let web = { used: false, answer: "", results: [] };
     if (TAVILY_KEY) {
       try {
-        const q1 = `${brand} ${model || category} used price ${city} ${state} India`;
-        const q2 = `${brand} ${model || category} resale price India`;
+        const q1 = `${brand} ${deviceModel || category} used price ${city} ${state} India`;
+        const q2 = `${brand} ${deviceModel || category} resale price India`;
 
         const tRes = await withTimeout(
           fetch("https://api.tavily.com/search", {
@@ -76,12 +66,10 @@ exports.handler = async (event) => {
             headers: { "content-type": "application/json" },
             body: JSON.stringify({
               api_key: TAVILY_KEY,
-              query: `Find recent used-market prices and listing ranges for ${brand} ${model || category} in ${city}, ${state}, India.`,
+              query: `Find recent used-market prices and listing ranges for ${brand} ${deviceModel || category} in ${city}, ${state}, India.`,
               search_depth: "advanced",
               max_results: 8,
               include_answer: true,
-              include_domains: [],
-              exclude_domains: [],
               topic: "general",
               days: 365,
               include_images: false,
@@ -93,10 +81,7 @@ exports.handler = async (event) => {
           "tavily"
         );
 
-        if (!tRes.ok) {
-          // Graceful fallback
-          web.used = false;
-        } else {
+        if (tRes.ok) {
           const tJson = await tRes.json();
           web.used = true;
           web.answer = tJson?.answer || "";
@@ -108,14 +93,10 @@ exports.handler = async (event) => {
               }))
             : [];
         }
-      } catch {
-        web.used = false;
-        web.answer = "";
-        web.results = [];
-      }
+      } catch { /* graceful fallback */ }
     }
 
-    // ---- 2) System prompt + JSON schema for Responses API ----
+    // ---- 2) System + schema ----
     const sys = [
       "You are an Indian marketplace price advisor.",
       "Estimate a used-market band and a realistic quick-sale price for the item in the user's city/region.",
@@ -131,7 +112,7 @@ exports.handler = async (event) => {
       name: "PriceAdvice",
       schema: {
         type: "object",
-        additionalProperties: true, // (allow extra helpful fields if model adds them)
+        additionalProperties: true,
         properties: {
           market_price_low: { type: "number" },
           market_price_high: { type: "number" },
@@ -152,31 +133,21 @@ exports.handler = async (event) => {
             items: {
               type: "object",
               additionalProperties: false,
-              properties: {
-                title: { type: "string" },
-                url: { type: "string" },
-              },
+              properties: { title: { type: "string" }, url: { type: "string" } },
             },
           },
         },
-        required: [
-          "market_price_low",
-          "market_price_high",
-          "suggested_price",
-          "confidence",
-        ],
+        required: ["market_price_low", "market_price_high", "suggested_price", "confidence"],
       },
       strict: true,
     };
 
-    const topSources = (web.results || [])
-      .slice(0, 4)
-      .map((r) => ({ title: r.title, url: r.url }));
+    const topSources = (web.results || []).slice(0, 4).map((r) => ({ title: r.title, url: r.url }));
 
     const userCtx = {
       category,
       brand,
-      model,
+      model: deviceModel,                   // <— use deviceModel in payload
       region: [city, state].filter(Boolean).join(", "),
       input_price: price,
       web_used: web.used,
@@ -185,16 +156,12 @@ exports.handler = async (event) => {
       top_sources: topSources,
     };
 
-    // ---- 3) Choose model via header x-plan ----
+    // ---- 3) Choose OpenAI model (no name clash) ----
     const plan =
-      (event.headers["x-plan"] || event.headers["X-Plan"] || "free")
-        .toString()
-        .toLowerCase();
+      (event.headers["x-plan"] || event.headers["X-Plan"] || "free").toString().toLowerCase();
+    const aiModel = plan === "pro" ? "gpt-5-mini" : "gpt-4o-mini";   // <— renamed
 
-    // gpt-5-mini for pro, otherwise gpt-4o-mini (cheap + decent)
-    const model = plan === "pro" ? "gpt-5-mini" : "gpt-4o-mini";
-
-    // ---- 4) OpenAI Responses API call ----
+    // ---- 4) OpenAI Responses API ----
     const aiRes = await withTimeout(
       fetch("https://api.openai.com/v1/responses", {
         method: "POST",
@@ -203,20 +170,12 @@ exports.handler = async (event) => {
           Authorization: `Bearer ${OPENAI_KEY}`,
         },
         body: JSON.stringify({
-          model,
+          model: aiModel,                                    // <— use aiModel
           input: [
             { role: "system", content: [{ type: "text", text: sys }] },
             {
               role: "user",
-              content: [
-                {
-                  type: "text",
-                  text: JSON.stringify({
-                    task: "estimate_used_price_india",
-                    user_input: userCtx,
-                  }),
-                },
-              ],
+              content: [{ type: "text", text: JSON.stringify({ task: "estimate_used_price_india", user_input: userCtx }) }],
             },
           ],
           max_output_tokens: 900,
@@ -227,48 +186,29 @@ exports.handler = async (event) => {
       "openai"
     );
 
-    if (!aiRes.ok) {
-      const t = await aiRes.text();
-      return bad(400, `OpenAI error: ${t}`);
-    }
+    if (!aiRes.ok) return bad(400, `OpenAI error: ${await aiRes.text()}`);
 
     const aiJson = await aiRes.json();
-
-    // The Responses API provides a convenient output_text with our JSON schema text
     const raw = aiJson?.output_text || "";
     let parsed = {};
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      parsed = {};
-    }
+    try { parsed = JSON.parse(raw); } catch {}
 
-    // ---- 5) Post-fix sanity for numbers ----
+    // ---- 5) Sanity + defaults ----
     const ensureBand = (obj) => {
       let lo = Number(obj.market_price_low || 0);
       let hi = Number(obj.market_price_high || 0);
       let sg = Number(obj.suggested_price || 0);
-
       if (!Number.isFinite(lo) || lo <= 0) lo = Math.max(1, Math.round(price * 0.7));
       if (!Number.isFinite(hi) || hi <= 0) hi = Math.max(lo + 1, Math.round(price * 1.3));
       if (hi < lo) [lo, hi] = [hi, lo];
-      if (!Number.isFinite(sg) || sg <= 0) {
-        // bias slightly high for negotiation room
-        sg = Math.round(lo * 0.4 + hi * 0.6);
-      }
-
-      return {
-        ...obj,
-        market_price_low: lo,
-        market_price_high: hi,
-        suggested_price: sg,
-      };
+      if (!Number.isFinite(sg) || sg <= 0) sg = Math.round(lo * 0.4 + hi * 0.6);
+      return { ...obj, market_price_low: lo, market_price_high: hi, suggested_price: sg };
     };
 
     const safeSummary = (s) =>
       typeof s === "string" && s.trim()
         ? s.trim()
-        : `<p><b>${brand} ${model || category}, ${city}:</b> Limited public data found. Pricing is estimated from typical India used-market trends for this category and region. Choose an ask price near the mid of the range for a faster sale.</p>`;
+        : `<p><b>${brand} ${deviceModel || category}, ${city}:</b> Limited public data found. Pricing is estimated from typical India used-market trends for this category and region. Choose an ask price near the mid of the range for a faster sale.</p>`;
 
     const result = ensureBand({
       ...parsed,
@@ -276,13 +216,7 @@ exports.handler = async (event) => {
       sources: Array.isArray(parsed?.sources) ? parsed.sources.slice(0, 4) : topSources,
     });
 
-    return ok({
-      ok: true,
-      provider: "openai",
-      model,
-      result,
-      // debug: { web } // uncomment for troubleshooting
-    });
+    return ok({ ok: true, provider: "openai", model: aiModel, result }); // <— return aiModel
   } catch (e) {
     return bad(400, String(e?.message || e));
   }

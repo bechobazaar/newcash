@@ -3,32 +3,21 @@
 const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
 
 /* ─────────────────────────────────────────
-   Allowlist CORS (bechobazaar.com / *.netlify.app / localhost)
+   Small utilities
 ─────────────────────────────────────────── */
-const ORIGIN_ALLOWLIST = [
-  'https://bechobazaar.com',
-  'https://www.bechobazaar.com',
-  'https://bechobazaar.netlify.app',
-  'http://localhost:3000',
-  'http://127.0.0.1:3000',
-  'http://localhost:8080',
-  'http://127.0.0.1:8080',
-];
-function pickOrigin(event) {
-  const o = event?.headers?.origin || event?.headers?.Origin || '';
-  if (!o) return '*'; // no origin (curl / server -> allow)
-  try {
-    const u = new URL(o);
-    const host = u.hostname;
-    // allow any subdomain of netlify.app that is ours
-    if (host.endsWith('.netlify.app')) return o;
-    if (ORIGIN_ALLOWLIST.includes(o)) return o;
-  } catch {}
-  // Fallback: echo origin so browser accepts it (only if present)
-  return o || '*';
-}
+const ok = (body, event) => ({
+  statusCode: 200,
+  headers: cors(event),
+  body: JSON.stringify(body),
+});
+const err = (code, body, event) => ({
+  statusCode: code,
+  headers: cors(event),
+  body: JSON.stringify(body),
+});
+
 function cors(event) {
-  const origin = pickOrigin(event);
+  const origin = event?.headers?.origin || event?.headers?.Origin || '*';
   return {
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Methods': 'POST, OPTIONS, GET',
@@ -38,12 +27,6 @@ function cors(event) {
     'Content-Type': 'application/json; charset=utf-8',
   };
 }
-
-/* ─────────────────────────────────────────
-   Small utilities
-─────────────────────────────────────────── */
-const ok = (body, event) => ({ statusCode: 200, headers: cors(event), body: JSON.stringify(body) });
-const err = (code, body, event) => ({ statusCode: code, headers: cors(event), body: JSON.stringify(body) });
 function safeParseJSON(s) { try { return JSON.parse(s); } catch { return null; } }
 function num(n, def = 0) { const x = Number(n); return Number.isFinite(x) ? x : def; }
 function clip(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
@@ -71,19 +54,10 @@ function normalizeInput(raw = {}) {
     city: clean(raw.city),
     area: clean(raw.area),
     price: num(raw.price, 0),
-    condition: clean(raw.condition),
+    condition: clean(raw.condition),    // may be auto-extracted on client
     billBox: !!raw.billBox,
     age: clean(raw.age || raw.ageOrYear),
     kmDriven: clean(raw.kmDriven),
-    // vehicle extras (optional, helps context)
-    yearOfPurchase: clean(raw.yearOfPurchase),
-    tyreCondition: clean(raw.tyreCondition),
-    accidentStatus: clean(raw.accidentStatus),
-    allPapersAvailable: clean(raw.allPapersAvailable),
-    pollutionExpiry: clean(raw.pollutionExpiry),
-    taxExpiry: clean(raw.taxExpiry),
-    insuranceExpiry: clean(raw.insuranceExpiry),
-    ownership: clean(raw.ownership),
   };
   if (out.price < 0) out.price = 0;
   if (out.price > 2e8) out.price = 2e8;
@@ -94,10 +68,10 @@ function normalizeInput(raw = {}) {
    Heuristic fallback (when OpenAI fails)
 ─────────────────────────────────────────── */
 function fallbackHeuristic(i = {}) {
-  // Baseline guess for a few common anchors, otherwise 1L
+  // Baseline MRP guess
   let baseMrp = 100000;
   const key = `${i.brand || ''} ${i.model || ''}`.toLowerCase();
-  if (key.includes('s24') && key.includes('ultra')) baseMrp = 88000;   // approx street for 256GB
+  if (key.includes('s24') && key.includes('ultra')) baseMrp = 88000;
   if (key.includes('iphone 15')) baseMrp = 70000;
 
   // condition factor
@@ -110,7 +84,7 @@ function fallbackHeuristic(i = {}) {
   else if (/fair|used/.test(c)) factor = 0.60;
   else if (/poor|broken|crack|damaged/.test(c)) factor = 0.45;
 
-  // age factor (~1.5%/month decay up to 24m; mobiles)
+  // age factor (~1.5%/month decay up to 24m)
   let ageFactor = 1.0;
   const m = i.age && i.age.match(/(\d+)\s*(month|months|yr|year|years?)/i);
   if (m) {
@@ -122,21 +96,7 @@ function fallbackHeuristic(i = {}) {
   // bill/box small premium
   const bb = i.billBox ? 1.02 : 1.0;
 
-  let mid = Math.round(baseMrp * factor * ageFactor * bb);
-
-  // Crude extra adjustments (vehicles)
-  const cat = (i.category || '').toLowerCase();
-  const km = Number(i.kmDriven || 0) || 0;
-  if (cat === 'cars') {
-    if (km > 150000) mid = Math.round(mid * 0.90);
-    else if (km > 100000) mid = Math.round(mid * 0.93);
-    else if (km > 60000) mid = Math.round(mid * 0.96);
-  } else if (cat === 'bikes') {
-    if (km > 80000) mid = Math.round(mid * 0.90);
-    else if (km > 50000) mid = Math.round(mid * 0.93);
-    else if (km > 30000) mid = Math.round(mid * 0.96);
-  }
-
+  const mid = Math.round(baseMrp * factor * ageFactor * bb);
   const low = Math.round(mid * 0.92);
   const high = Math.round(mid * 1.08);
   const suggest = Math.round((low + high) / 2);
@@ -145,8 +105,8 @@ function fallbackHeuristic(i = {}) {
 
   return {
     refs: {
-      launch: `Approx new/launch reference around ₹${fmtINR(baseMrp)} (estimated).`,
-      used: `Used market (heuristic): like-new often listed ₹${fmtINR(low)}–₹${fmtINR(high)}.`,
+      launch: `Approx new/launch reference around ₹${fmtINR(baseMrp)} for this variant (estimated).`,
+      used: `Used market (heuristic): like-new items often listed in ₹${fmtINR(low)}–₹${fmtINR(high)} range.`,
     },
     band: { low, high, suggest, quick, patience },
   };
@@ -172,7 +132,7 @@ function coerceOpenAIToBand(json) {
     },
   };
 
-  // Try parse from free text as fallback
+  // If missing low/high but text exists, attempt parse from text
   if ((!out.band.low || !out.band.high) && (json.html || json.text || json.markdown)) {
     const s = String(json.html || json.text || json.markdown);
     const m = s.match(/₹?\s?([\d,]+)\s*(?:to|-|–)\s*₹?\s?([\d,]+)/i);
@@ -186,6 +146,7 @@ function coerceOpenAIToBand(json) {
       }
     }
   }
+
   if (!out.band.low || !out.band.high) return null;
   return out;
 }
@@ -202,6 +163,7 @@ exports.handler = async (event) => {
     const body = safeParseJSON(event.body || '{}') || {};
     const inputRaw = body.input;
     if (!inputRaw) return err(400, { error: 'missing input' }, event);
+
     const input = normalizeInput(inputRaw);
 
     const prompt = `
@@ -213,37 +175,41 @@ You are a pricing advisor for Indian C2C classifieds. Return STRICT JSON ONLY:
 Inputs:
 brand=${input.brand}, model=${input.model}, category=${input.category}, subCategory=${input.subCategory},
 condition=${input.condition}, billBox=${input.billBox}, age=${input.age}, kmDriven=${input.kmDriven},
-city=${input.city}, state=${input.state}, userPrice=${input.price},
-ownership=${input.ownership}, accidentStatus=${input.accidentStatus}, tyreCondition=${input.tyreCondition},
-papers=${input.allPapersAvailable}, insuranceExpiry=${input.insuranceExpiry}, taxExpiry=${input.taxExpiry}, pollutionExpiry=${input.pollutionExpiry}.
-Numbers must be INR (no commas in JSON numbers). Keep refs short, factual.
+city=${input.city}, state=${input.state}, userPrice=${input.price}.
+Numbers must be Indian INR (no commas in JSON numbers). Keep refs short, factual.
 `.trim();
 
     const OPENAI_KEY = process.env.OPENAI_API_KEY;
     const MODEL_PRIMARY = event.headers['x-openai-model'] || 'gpt-4.1-mini';
-
     if (!OPENAI_KEY) {
       const fb = fallbackHeuristic(input);
       fb.warning = 'OPENAI_API_KEY missing → heuristic';
       return ok(fb, event);
     }
 
-    // Responses API (JSON mode, simple string input)
+    // ===== OpenAI call (Responses → plain string JSON mode) with Chat fallback
     async function callOpenAIResponses(promptStr, signal) {
       const r = await fetch('https://api.openai.com/v1/responses', {
         method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${OPENAI_KEY}` },
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${OPENAI_KEY}`,
+        },
         body: JSON.stringify({
           model: MODEL_PRIMARY,
-          input: promptStr,
+          input: promptStr,                 // IMPORTANT: a plain string
           response_format: { type: 'json_object' },
         }),
         signal,
       });
+
       if (!r.ok) {
         const text = await r.text().catch(()=>'');
-        const e = new Error('responses_api_error'); e.payload = text; throw e;
+        const err = new Error('responses_api_error');
+        err.payload = text;
+        throw err;
       }
+
       const data = await r.json();
       return (
         safeParseJSON(data.output_text) ||
@@ -252,12 +218,14 @@ Numbers must be INR (no commas in JSON numbers). Keep refs short, factual.
       );
     }
 
-    // Chat fallback
     async function callOpenAIChat(promptStr, signal) {
       const chatModel = 'gpt-4o-mini';
       const r = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${OPENAI_KEY}` },
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${OPENAI_KEY}`,
+        },
         body: JSON.stringify({
           model: chatModel,
           response_format: { type: 'json_object' },
@@ -268,12 +236,17 @@ Numbers must be INR (no commas in JSON numbers). Keep refs short, factual.
         }),
         signal,
       });
+
       if (!r.ok) {
         const text = await r.text().catch(()=>'');
-        const e = new Error('chat_api_error'); e.payload = text; throw e;
+        const err = new Error('chat_api_error');
+        err.payload = text;
+        throw err;
       }
+
       const data = await r.json();
-      return safeParseJSON(data.choices?.[0]?.message?.content || '');
+      const txt = data.choices?.[0]?.message?.content || '';
+      return safeParseJSON(txt);
     }
 
     // Timeout + fallbacks
@@ -291,6 +264,7 @@ Numbers must be INR (no commas in JSON numbers). Keep refs short, factual.
         fb.error = 'OpenAI error';
         fb.detail = (e1 && e1.payload ? e1.payload : String(e1)).slice(0, 900);
         clearTimeout(to);
+        // Try coercing if candidate has something, else fallback object
         return ok(coerceOpenAIToBand(candidate) || fb, event);
       }
     } finally {

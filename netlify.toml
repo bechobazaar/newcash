@@ -61,6 +61,30 @@
 [functions."auto-bump"]
   schedule = "*/10 * * * *"
 
+# ─────────────────────────────────────────────────────────────
+# 🟢 CORS for your price advisor function (exact path)
+# ─────────────────────────────────────────────────────────────
+[[headers]]
+  for = "/.netlify/functions/price-advisor-web"
+  [headers.values]
+    Access-Control-Allow-Origin  = "*"
+    Access-Control-Allow-Methods = "POST, OPTIONS"
+    Access-Control-Allow-Headers = "Content-Type, X-Plan"
+    Access-Control-Max-Age       = "600"
+    Vary                         = "Origin"
+
+# ─────────────────────────────────────────────────────────────
+# 🟢 (Optional) CORS fallback for all functions (kept last)
+# If you have other functions and also want them callable from web.
+# ─────────────────────────────────────────────────────────────
+[[headers]]
+  for = "/.netlify/functions/*"
+  [headers.values]
+    Access-Control-Allow-Origin  = "*"
+    Access-Control-Allow-Methods = "GET, POST, OPTIONS"
+    Access-Control-Allow-Headers = "Content-Type, X-Plan, Authorization"
+    Access-Control-Max-Age       = "600"
+    Vary                         = "Origin"
 
 
 

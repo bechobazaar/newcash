@@ -1,6 +1,5 @@
 // netlify/functions/price-advisor-web.js
 
-// ---------- CORS ----------
 const CORS = {
   "content-type": "application/json; charset=utf-8",
   "access-control-allow-origin": "*",
@@ -10,14 +9,14 @@ const CORS = {
   "vary": "Origin",
 };
 
-const ok = (body, headers = {}) => ({
+const ok = (body, extra = {}) => ({
   statusCode: 200,
-  headers: { ...CORS, ...headers },
+  headers: { ...CORS, ...extra },
   body: typeof body === "string" ? body : JSON.stringify(body),
 });
 
-const bad = (statusCode, msg) => ({
-  statusCode,
+const bad = (code, msg) => ({
+  statusCode: code,
   headers: CORS,
   body: JSON.stringify({ error: msg }),
 });
@@ -31,9 +30,7 @@ const withTimeout = (p, ms = 25000, label = "request") => {
 };
 
 exports.handler = async (event) => {
-  if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 204, headers: CORS, body: "" };
-  }
+  if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: CORS, body: "" };
   if (event.httpMethod !== "POST") return bad(405, "POST only");
 
   const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
@@ -44,7 +41,7 @@ exports.handler = async (event) => {
     const { input = {} } = JSON.parse(event.body || "{}");
     const category = (input.category || "").trim();
     const brand = (input.brand || "").trim();
-    const deviceModel = (input.model || "").trim();          // <— renamed
+    const deviceModel = (input.model || "").trim();
     const city = (input.city || "").trim();
     const state = (input.state || "").trim();
     const price = Number(input.price || 0) || 0;
@@ -53,7 +50,7 @@ exports.handler = async (event) => {
       return bad(400, "Missing required fields (category, brand, city, state)");
     }
 
-    // ---- 1) Tavily (optional) ----
+    // ---------- Tavily (optional web grounding) ----------
     let web = { used: false, answer: "", results: [] };
     if (TAVILY_KEY) {
       try {
@@ -93,10 +90,10 @@ exports.handler = async (event) => {
               }))
             : [];
         }
-      } catch { /* graceful fallback */ }
+      } catch {}
     }
 
-    // ---- 2) System + schema ----
+    // ---------- Prompt + JSON schema ----------
     const sys = [
       "You are an Indian marketplace price advisor.",
       "Estimate a used-market band and a realistic quick-sale price for the item in the user's city/region.",
@@ -104,11 +101,11 @@ exports.handler = async (event) => {
       "Consider condition, storage/variant, bill/box availability, battery health for phones, and location demand.",
       "Return strictly the requested JSON schema.",
       "Also produce a short HTML paragraph named webview_summary_html (2–4 sentences) that reads like a web-browse result:",
-      "start with bold model + city, summarize the current market range and a recommended ask price, and mention key factors briefly.",
+      "start with bold model + city, summarize current market range and a recommended ask price, and mention key factors briefly.",
       "If web_results exist, ground your paragraph and add 2–4 sources (title + url). If no web data, still write a helpful paragraph and keep sources empty.",
     ].join(" ");
 
-    const schema = {
+    const jsonSchema = {
       name: "PriceAdvice",
       schema: {
         type: "object",
@@ -143,11 +140,10 @@ exports.handler = async (event) => {
     };
 
     const topSources = (web.results || []).slice(0, 4).map((r) => ({ title: r.title, url: r.url }));
-
     const userCtx = {
       category,
       brand,
-      model: deviceModel,                   // <— use deviceModel in payload
+      model: deviceModel,
       region: [city, state].filter(Boolean).join(", "),
       input_price: price,
       web_used: web.used,
@@ -156,44 +152,74 @@ exports.handler = async (event) => {
       top_sources: topSources,
     };
 
-    // ---- 3) Choose OpenAI model (no name clash) ----
     const plan =
       (event.headers["x-plan"] || event.headers["X-Plan"] || "free").toString().toLowerCase();
-    const aiModel = plan === "pro" ? "gpt-5-mini" : "gpt-4o-mini";   // <— renamed
+    const aiModel = plan === "pro" ? "gpt-5-mini" : "gpt-4o-mini";
 
-    // ---- 4) OpenAI Responses API ----
-    const aiRes = await withTimeout(
-      fetch("https://api.openai.com/v1/responses", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          Authorization: `Bearer ${OPENAI_KEY}`,
-        },
-        body: JSON.stringify({
-          model: aiModel,                                    // <— use aiModel
-          input: [
-            { role: "system", content: [{ type: "text", text: sys }] },
-            {
-              role: "user",
-              content: [{ type: "text", text: JSON.stringify({ task: "estimate_used_price_india", user_input: userCtx }) }],
-            },
-          ],
-          max_output_tokens: 900,
-          format: { type: "json_schema", json_schema: schema },
+    // ---------- Call OpenAI — try JSON schema first ----------
+    async function callOpenAI(payload) {
+      const r = await withTimeout(
+        fetch("https://api.openai.com/v1/responses", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            Authorization: `Bearer ${OPENAI_KEY}`,
+          },
+          body: JSON.stringify(payload),
         }),
-      }),
-      25000,
-      "openai"
-    );
+        25000,
+        "openai"
+      );
+      if (!r.ok) {
+        const txt = await r.text();
+        throw new Error(txt);
+      }
+      return r.json();
+    }
 
-    if (!aiRes.ok) return bad(400, `OpenAI error: ${await aiRes.text()}`);
+    let aiJson, raw;
+    try {
+      aiJson = await callOpenAI({
+        model: aiModel,
+        input: [
+          { role: "system", content: [{ type: "text", text: sys }] },
+          { role: "user", content: [{ type: "text", text: JSON.stringify({ task: "estimate_used_price_india", user_input: userCtx }) }] },
+        ],
+        max_output_tokens: 900,
+        // ✅ correct key for schema:
+        response_format: { type: "json_schema", json_schema: jsonSchema },
+      });
+      raw = aiJson?.output_text || "";
+    } catch (e) {
+      // If server says unknown/unsupported parameter, retry without schema and parse manually
+      const msg = String(e.message || e);
+      const looksLikeSchemaUnsupported =
+        /response_format|Unknown parameter|unsupported/i.test(msg);
+      if (!looksLikeSchemaUnsupported) throw new Error(`OpenAI error: ${msg}`);
 
-    const aiJson = await aiRes.json();
-    const raw = aiJson?.output_text || "";
+      const aiJson2 = await callOpenAI({
+        model: aiModel,
+        input: [
+          { role: "system", content: [{ type: "text", text: sys }] },
+          { role: "user", content: [{ type: "text", text: JSON.stringify({ task: "estimate_used_price_india", user_input: userCtx }) }] },
+        ],
+        max_output_tokens: 900,
+      });
+      raw = aiJson2?.output_text || "";
+    }
+
     let parsed = {};
-    try { parsed = JSON.parse(raw); } catch {}
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      // crude extraction fallback: find first {...} and parse
+      const m = raw.match(/\{[\s\S]*\}/);
+      if (m) {
+        try { parsed = JSON.parse(m[0]); } catch {}
+      }
+    }
 
-    // ---- 5) Sanity + defaults ----
+    // ---------- Sanity guards ----------
     const ensureBand = (obj) => {
       let lo = Number(obj.market_price_low || 0);
       let hi = Number(obj.market_price_high || 0);
@@ -216,8 +242,8 @@ exports.handler = async (event) => {
       sources: Array.isArray(parsed?.sources) ? parsed.sources.slice(0, 4) : topSources,
     });
 
-    return ok({ ok: true, provider: "openai", model: aiModel, result }); // <— return aiModel
+    return ok({ ok: true, provider: "openai", model: aiModel, result });
   } catch (e) {
-    return bad(400, String(e?.message || e));
+    return bad(400, `OpenAI error: ${String(e.message || e)}`);
   }
 };

@@ -54,7 +54,7 @@ function normalizeInput(raw = {}) {
     city: clean(raw.city),
     area: clean(raw.area),
     price: num(raw.price, 0),
-    condition: clean(raw.condition),    // may be auto-extracted on client
+    condition: clean(raw.condition),
     billBox: !!raw.billBox,
     age: clean(raw.age || raw.ageOrYear),
     kmDriven: clean(raw.kmDriven),
@@ -65,7 +65,99 @@ function normalizeInput(raw = {}) {
 }
 
 /* ─────────────────────────────────────────
-   Heuristic fallback (when OpenAI fails)
+   Strict validation (NEW)
+─────────────────────────────────────────── */
+const CONDITION_ALLOW = [
+  'new','sealed','like new','excellent','mint','scratchless',
+  'very good','good','fair','used','poor','broken','crack','damaged'
+];
+
+function parseKm(s) {
+  if (!s) return NaN;
+  const t = String(s).replace(/[^\d]/g, '');        // keep digits only
+  if (!t) return NaN;
+  const x = Number(t);
+  return Number.isFinite(x) ? x : NaN;
+}
+
+// Returns age in months if parseable, else NaN.
+// Accepts "6 months", "1 year", "2 yrs", or vehicle YOM "2022".
+function parseAgeMonths(s) {
+  if (!s) return NaN;
+  const str = String(s).toLowerCase().trim();
+
+  // "6 month(s)", "1 year", "2 yrs"
+  let m = str.match(/(\d+)\s*(month|months|yr|year|years?)/i);
+  if (m) {
+    const n = Number(m[1] || 0);
+    const months = /month/.test(m[2]) ? n : n * 12;
+    return Number.isFinite(months) ? months : NaN;
+  }
+
+  // Pure year for vehicles, e.g., "2022"
+  const y = str.match(/^(19|20)\d{2}$/);
+  if (y) {
+    const year = Number(y[0]);
+    const now = new Date();
+    const months = (now.getFullYear() - year) * 12 + (now.getMonth() + 1);
+    return months >= 0 ? months : NaN;
+  }
+
+  return NaN;
+}
+
+function validateInput(i) {
+  const errors = [];
+  const requiredByCat = {
+    Mobiles: ['brand','model','condition','age'],
+    Phones:  ['brand','model','condition','age'],     // alias if you use it
+    Cars:    ['brand','model','kmDriven','age'],
+    Bikes:   ['brand','model','kmDriven','age'],
+  };
+
+  const cat = (i.category || '').trim();
+  const req = requiredByCat[cat] || ['brand','model']; // default minimal
+
+  // Presence checks
+  for (const k of req) {
+    if (!String(i[k] || '').trim()) errors.push(`${k} is required for ${cat || 'this category'}`);
+  }
+
+  // Format/whitelist checks
+  if (req.includes('condition')) {
+    const c = (i.condition || '').toLowerCase();
+    if (!CONDITION_ALLOW.some(w => c.includes(w))) {
+      errors.push(`condition must be one of: ${CONDITION_ALLOW.join(', ')}`);
+    }
+  }
+
+  if (req.includes('age')) {
+    const months = parseAgeMonths(i.age);
+    if (!Number.isFinite(months) || months < 0 || months > 240) {
+      errors.push('age must be like "6 months", "2 years" or valid year (e.g., 2021)');
+    }
+  }
+
+  if (req.includes('kmDriven')) {
+    const km = parseKm(i.kmDriven);
+    if (!Number.isFinite(km) || km < 0 || km > 2_000_000) {
+      errors.push('kmDriven must be a number like 35,000');
+    }
+  }
+
+  // Sanity: brand+model should not be unreasonably short
+  if ((i.brand || '').length < 2) errors.push('brand looks too short');
+  if (req.includes('model') && (i.model || '').length < 2) errors.push('model looks too short');
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    required: req,
+  };
+}
+
+/* ─────────────────────────────────────────
+   Heuristic fallback (used only when valid)
 ─────────────────────────────────────────── */
 function fallbackHeuristic(i = {}) {
   // Baseline MRP guess
@@ -86,10 +178,8 @@ function fallbackHeuristic(i = {}) {
 
   // age factor (~1.5%/month decay up to 24m)
   let ageFactor = 1.0;
-  const m = i.age && i.age.match(/(\d+)\s*(month|months|yr|year|years?)/i);
-  if (m) {
-    const n = Number(m[1] || 0);
-    const months = /month/.test(m[2]) ? n : n * 12;
+  const months = parseAgeMonths(i.age);
+  if (Number.isFinite(months)) {
     ageFactor = clip(1 - 0.015 * clip(months, 0, 24), 0.6, 1.0);
   }
 
@@ -166,6 +256,17 @@ exports.handler = async (event) => {
 
     const input = normalizeInput(inputRaw);
 
+    // ===== NEW: Strict validation gate =====
+    const v = validateInput(input);
+    if (!v.ok) {
+      return ok({
+        error: 'insufficient_input',
+        show: false,                  // front-end should hide details
+        reasons: v.errors,            // show to user
+        required: v.required,         // which fields are needed
+      }, event);
+    }
+
     const prompt = `
 You are a pricing advisor for Indian C2C classifieds. Return STRICT JSON ONLY:
 {
@@ -181,6 +282,8 @@ Numbers must be Indian INR (no commas in JSON numbers). Keep refs short, factual
 
     const OPENAI_KEY = process.env.OPENAI_API_KEY;
     const MODEL_PRIMARY = event.headers['x-openai-model'] || 'gpt-4.1-mini';
+
+    // If no key, still DO NOT show details unless validation passed (it did).
     if (!OPENAI_KEY) {
       const fb = fallbackHeuristic(input);
       fb.warning = 'OPENAI_API_KEY missing → heuristic';
@@ -197,7 +300,7 @@ Numbers must be Indian INR (no commas in JSON numbers). Keep refs short, factual
         },
         body: JSON.stringify({
           model: MODEL_PRIMARY,
-          input: promptStr,                 // IMPORTANT: a plain string
+          input: promptStr,
           response_format: { type: 'json_object' },
         }),
         signal,
@@ -264,7 +367,6 @@ Numbers must be Indian INR (no commas in JSON numbers). Keep refs short, factual
         fb.error = 'OpenAI error';
         fb.detail = (e1 && e1.payload ? e1.payload : String(e1)).slice(0, 900);
         clearTimeout(to);
-        // Try coercing if candidate has something, else fallback object
         return ok(coerceOpenAIToBand(candidate) || fb, event);
       }
     } finally {
@@ -289,9 +391,20 @@ Numbers must be Indian INR (no commas in JSON numbers). Keep refs short, factual
 
     return ok(final, event);
   } catch (e) {
+    // If something explodes after validation, we can still return heuristic,
+    // but only if validation had passed. Try to re-read input to decide.
     const input = (() => {
       try { return normalizeInput((safeParseJSON(event.body || '{}') || {}).input); } catch { return {}; }
     })();
+    const v = validateInput(input);
+    if (!v.ok) {
+      return ok({
+        error: 'insufficient_input',
+        show: false,
+        reasons: v.errors,
+        required: v.required,
+      }, event);
+    }
     const fb = fallbackHeuristic(input || {});
     fb.error = String(e && e.message ? e.message : e);
     return ok(fb, event);

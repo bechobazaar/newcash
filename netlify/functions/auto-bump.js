@@ -76,6 +76,18 @@ exports.handler = async () => {
       const it = doc.data() || {};
       const b  = it.boost || {};
 
+      // ✅ visibility guard: sirf "public" ads hi bump honge
+      //   - agar tum "visibility" field use kar rahe ho: it.visibility
+      //   - agar "status" use karte ho: it.status bhi cover ho jayega
+      const isPublic =
+        ((it.visibility || it.status || "") + "").toLowerCase() === "public";
+
+      if (!isPublic) {
+        // not live / not public → skip bump
+        skipped++;
+        return;
+      }
+
       const active = !!b.active;
       const endAt  = toMillis(b.endAt);
       const nextAt = toMillis(b.nextBumpAt);

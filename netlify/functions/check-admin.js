@@ -18,7 +18,6 @@ function init() {
   initialized = true;
 }
 
-// Allow both domains
 const ALLOWED_ORIGINS = [
   "https://bechobazaar.com",
   "https://bechobazaar.netlify.app"
@@ -68,7 +67,12 @@ exports.handler = async (event) => {
       .map(e => e.trim().toLowerCase())
       .filter(Boolean);
 
-    const ok = allowed.includes(email);
+    // 🔥 DEBUG LOGS (Netlify → Functions → Logs me dikhega)
+    console.log("LOGIN EMAIL:", email);
+    console.log("ALLOWED LIST:", allowed);
+
+    // TEMP: allow wildcard
+    const ok = allowed.includes(email) || allowed.includes("*");
 
     if (!ok) {
       return { statusCode: 403, headers, body: "Forbidden" };
@@ -81,6 +85,7 @@ exports.handler = async (event) => {
     };
 
   } catch (e) {
+    console.error("ERROR:", e);
     return {
       statusCode: 500,
       headers: corsHeaders(event.headers?.origin),

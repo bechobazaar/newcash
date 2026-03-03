@@ -14,7 +14,7 @@ function getAdmin(){
 exports.handler = async () => {
   try {
     const adminSDK = getAdmin();
-    const uid = "DIz6jbc2xrSZWpkqF5yF2maLcoy2";
+    const uid = "xXeLXRlYn7YJwDRQKnVIgnvPiTh1";
     await adminSDK.auth().setCustomUserClaims(uid, { admin: true });
     return { statusCode: 200, body: JSON.stringify({ ok: true, uid }) };
   } catch (e) {

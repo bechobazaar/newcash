@@ -5,39 +5,42 @@
 [functions]
   directory = "netlify/functions"
   node_bundler = "esbuild"
-  
 
 [build.environment]
   NODE_VERSION = "18"
 
-# ✅ Friendly alias for functions: /api/<name> -> /.netlify/functions/<name>
+# ✅ API routing
 [[redirects]]
   from = "/api/*"
   to   = "/.netlify/functions/:splat"
   status = 200
 
-# 🛡️ Service worker: always fetch fresh
+# 🛡️ Service worker: always fresh
 [[headers]]
   for = "/firebase-messaging-sw.js"
   [headers.values]
     Cache-Control = "no-store"
 
-
-# SW file should bypass SPA rewrites
 [[redirects]]
   from = "/firebase-messaging-sw.js"
   to   = "/firebase-messaging-sw.js"
   status = 200
   force = true
 
-# ✅ Serve manifest as-is (avoid SPA rewrite)
+# ✅ Manifest fix
 [[redirects]]
   from = "/manifest.webmanifest"
   to   = "/manifest.webmanifest"
   status = 200
   force = true
 
-# Canonicalize www -> apex
+[[headers]]
+  for = "/manifest.webmanifest"
+  [headers.values]
+    Content-Type = "application/manifest+json; charset=utf-8"
+    Cache-Control = "no-store"
+
+# 🌐 Canonical domain
 [[redirects]]
   from = "http://www.bechobazaar.com/*"
   to = "https://bechobazaar.com/:splat"
@@ -50,20 +53,25 @@
   status = 301
   force = true
 
-# ✅ Correct MIME for manifest
-[[headers]]
-  for = "/manifest.webmanifest"
-  [headers.values]
-    Content-Type = "application/manifest+json; charset=utf-8"
-    Cache-Control = "no-store"
-
-# (optional) keep only if you actually have this function file
+# ⏱️ Scheduled function (optional)
 [functions."auto-bump"]
   schedule = "*/10 * * * *"
 
-# ─────────────────────────────────────────────────────────────
-# 🟢 CORS for your price advisor function (exact path)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────
+# 🔥 CORS for AUDIO SPLITTER (NEW ADD)
+# ─────────────────────────────────────────
+[[headers]]
+  for = "/.netlify/functions/split-audio"
+  [headers.values]
+    Access-Control-Allow-Origin  = "*"
+    Access-Control-Allow-Methods = "POST, OPTIONS"
+    Access-Control-Allow-Headers = "Content-Type, Authorization"
+    Access-Control-Max-Age       = "600"
+    Vary                         = "Origin"
+
+# ─────────────────────────────────────────
+# Existing function CORS (unchanged)
+# ─────────────────────────────────────────
 [[headers]]
   for = "/.netlify/functions/price-advisor-web"
   [headers.values]
@@ -73,18 +81,14 @@
     Access-Control-Max-Age       = "600"
     Vary                         = "Origin"
 
-# ─────────────────────────────────────────────────────────────
-# 🟢 (Optional) CORS fallback for all functions (kept last)
-# If you have other functions and also want them callable from web.
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────
+# 🔥 Global fallback (IMPORTANT FIX)
+# ─────────────────────────────────────────
 [[headers]]
   for = "/.netlify/functions/*"
   [headers.values]
     Access-Control-Allow-Origin  = "*"
     Access-Control-Allow-Methods = "GET, POST, OPTIONS"
-    Access-Control-Allow-Headers = "Content-Type, X-Plan, Authorization"
+    Access-Control-Allow-Headers = "Content-Type, Authorization, X-Plan"
     Access-Control-Max-Age       = "600"
     Vary                         = "Origin"
-
-
-
